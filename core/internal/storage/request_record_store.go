@@ -8,6 +8,7 @@ import (
 )
 
 type RequestRecordListOptions struct {
+	ToolReviewStatus    string
 	Limit               int
 	Cursor              string
 	From                *time.Time

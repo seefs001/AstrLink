@@ -1,6 +1,7 @@
 import { isWebEdition } from "./edition";
 import { webText } from "./web-copy";
 import { useWorkspaceSnapshot } from "./workspace-snapshots";
+import { ToolReviewSettings } from "./ToolReviewSettings";
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   ArrowUpRight,
@@ -125,7 +126,12 @@ import {
 import type { DryRunTextSpan } from "./privacy-dry-run-model";
 
 type SafetyPolicyStatus = "blocked" | "loading" | "ready" | "error";
-type WorkspaceView = "detection" | "redaction" | "dryRun" | "models";
+type WorkspaceView =
+  | "detection"
+  | "redaction"
+  | "dryRun"
+  | "models"
+  | "toolReview";
 type ModelView = "catalog" | "installed" | "custom" | "local";
 type ProbeView = Extract<ModelView, "custom" | "local">;
 
@@ -1180,6 +1186,12 @@ export function SafetyPolicy({
   );
   const initialWorkspace: WorkspaceView = initialView ?? "detection";
   const [workspace, setWorkspace] = useState<WorkspaceView>(initialWorkspace);
+  // Tool review loads on first visit, then stays mounted so its draft survives
+  // switching between policy tabs.
+  const [toolReviewVisited, setToolReviewVisited] = useState(false);
+  if (workspace === "toolReview" && !toolReviewVisited) {
+    setToolReviewVisited(true);
+  }
   const [allowlistQuery, setAllowlistQuery] = useState("");
   const [view, setView] = useState<ModelView>("catalog");
   const [selectedVariants, setSelectedVariants] = useState<
@@ -2550,6 +2562,46 @@ export function SafetyPolicy({
             installation.id === pendingModelAction.installationID,
         ) ?? null);
 
+  const workspaceNavigation = (
+    <>
+      <TabsList
+        aria-label={t("safety.workspace")}
+        className="shrink-0"
+        scrollable
+      >
+        <TabsTrigger value="detection">
+          <ScanLine aria-hidden="true" />
+          {t("safety.detectionAndRestore")}
+        </TabsTrigger>
+        <TabsTrigger value="redaction">
+          <SlidersHorizontal aria-hidden="true" />
+          {t("safety.redactionRules")}
+        </TabsTrigger>
+        <TabsTrigger
+          aria-label={t("safety.run")}
+          onClick={() => setWorkspace("dryRun")}
+          value="dryRun"
+        >
+          <FlaskConical aria-hidden="true" />
+          {t("safety.run")}
+        </TabsTrigger>
+        <TabsTrigger onClick={() => setWorkspace("models")} value="models">
+          <Boxes aria-hidden="true" />
+          {t("safety.tabModels")}
+        </TabsTrigger>
+        <TabsTrigger value="toolReview">{t("toolReview.title")}</TabsTrigger>
+      </TabsList>
+      <TabsContent
+        value="toolReview"
+        className="min-h-0 min-w-0 flex-1 overflow-hidden"
+        forceMount={toolReviewVisited || undefined}
+        hidden={workspace !== "toolReview"}
+      >
+        <ToolReviewSettings coreSessionKey={coreSessionKey} isReady={isReady} />
+      </TabsContent>
+    </>
+  );
+
   return (
     <div
       className="@container/privacy gutter-frame flex h-full min-h-0 w-full min-w-0 flex-col overflow-hidden"
@@ -2579,7 +2631,7 @@ export function SafetyPolicy({
                 {t("common.saving")}
               </span>
             ) : null}
-            {policy !== null ? (
+            {policy !== null && workspace !== "toolReview" ? (
               <>
                 <Label className="inline-flex cursor-pointer items-center gap-2.5 border-r pr-3 text-xs font-medium">
                   <span>{t("safety.enable")}</span>
@@ -2627,11 +2679,11 @@ export function SafetyPolicy({
         titleId="safety-policy-heading"
       />
 
-      {error ? (
+      {error && workspace !== "toolReview" ? (
         <OperationErrorMessage className="mb-2.5" error={error} />
       ) : null}
 
-      {status === "loading" && record === null ? (
+      {status === "loading" && record === null && workspace !== "toolReview" ? (
         <div
           className="grid min-w-0 gap-3 rounded-lg border bg-card p-5"
           aria-label={t("safety.loading")}
@@ -2641,7 +2693,7 @@ export function SafetyPolicy({
         </div>
       ) : null}
 
-      {status === "error" && record === null ? (
+      {status === "error" && record === null && workspace !== "toolReview" ? (
         <EmptyState
           action={
             <Button variant="outline" onClick={refresh} type="button">
@@ -2659,33 +2711,7 @@ export function SafetyPolicy({
           onValueChange={(value) => setWorkspace(value as WorkspaceView)}
           value={workspace}
         >
-          <TabsList
-            aria-label={t("safety.workspace")}
-            className="shrink-0"
-            scrollable
-          >
-            <TabsTrigger value="detection">
-              <ScanLine aria-hidden="true" />
-              {t("safety.detectionAndRestore")}
-            </TabsTrigger>
-            <TabsTrigger value="redaction">
-              <SlidersHorizontal aria-hidden="true" />
-              {t("safety.redactionRules")}
-            </TabsTrigger>
-            <TabsTrigger
-              aria-label={t("safety.run")}
-              onClick={() => setWorkspace("dryRun")}
-              value="dryRun"
-            >
-              <FlaskConical aria-hidden="true" />
-              {t("safety.run")}
-            </TabsTrigger>
-            <TabsTrigger onClick={() => setWorkspace("models")} value="models">
-              <Boxes aria-hidden="true" />
-              {t("safety.tabModels")}
-            </TabsTrigger>
-          </TabsList>
-
+          {workspaceNavigation}
           <TabsContent
             className="min-h-0 min-w-0 flex-1 overflow-y-clip"
             forceMount
@@ -3106,7 +3132,9 @@ export function SafetyPolicy({
                           checked={policy.placeholder_notice}
                           disabled={saving}
                           onCheckedChange={(checked) =>
-                            void patchPolicy({ placeholder_notice: checked })
+                            void patchPolicy({
+                              placeholder_notice: checked,
+                            })
                           }
                           size="sm"
                         />
@@ -3151,7 +3179,9 @@ export function SafetyPolicy({
                       checked={policy.skip_tool_declarations}
                       disabled={saving}
                       onCheckedChange={(checked) =>
-                        void patchPolicy({ skip_tool_declarations: checked })
+                        void patchPolicy({
+                          skip_tool_declarations: checked,
+                        })
                       }
                       size="sm"
                     />
@@ -3170,7 +3200,9 @@ export function SafetyPolicy({
                       checked={!policy.inspect_additional_tools}
                       disabled={saving}
                       onCheckedChange={(checked) =>
-                        void patchPolicy({ inspect_additional_tools: !checked })
+                        void patchPolicy({
+                          inspect_additional_tools: !checked,
+                        })
                       }
                       size="sm"
                     />
@@ -4714,6 +4746,14 @@ export function SafetyPolicy({
               </TabsContent>
             </Tabs>
           </TabsContent>
+        </Tabs>
+      ) : isReady ? (
+        <Tabs
+          className="flex min-h-0 min-w-0 flex-1 flex-col gap-3"
+          onValueChange={(value) => setWorkspace(value as WorkspaceView)}
+          value={workspace}
+        >
+          {workspaceNavigation}
         </Tabs>
       ) : null}
       {catalogPreparation !== null && catalogPreparationModel !== null ? (

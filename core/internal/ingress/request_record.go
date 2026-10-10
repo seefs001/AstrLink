@@ -204,7 +204,10 @@ type recordSession struct {
 	// codexOfficial is set when the current attempt forwarded a Codex
 	// subscription request with the Codex client's own identity.
 	codexOfficial bool
-	plan          *contract.ExecutionPlan
+	// A mapped main-model call only proposes this binding; the outer request
+	// must succeed before it becomes available to later Codex tool requests.
+	mappedCodexTurn *codexTurnBinding
+	plan            *contract.ExecutionPlan
 	// conversionDiagnostics is what the current attempt's local protocol
 	// conversion dropped or rewrote, request side first.
 	conversionDiagnostics []contract.ConversionDiagnostic
@@ -218,6 +221,9 @@ type recordSession struct {
 	// until one inspection decides.
 	privacyDecision contract.PrivacyDecision
 	privacyFindings []contract.PrivacyFinding
+	toolReview      *contract.ToolReviewSummary
+	toolReviewEOF   bool
+	afterToolReview func()
 	// requestExposure is the label of the stored client body; empty until
 	// it is stored.
 	requestExposure storage.AuditExposure
@@ -549,6 +555,7 @@ func (session *recordSession) recordSnapshot(
 		Error:              session.errorSummary,
 		Audit:              session.liveAuditSummary(),
 		PrivacyRestore:     session.privacyRestore,
+		ToolReview:         session.toolReview,
 		PrivacyFindings:    append([]contract.PrivacyFinding(nil), session.privacyFindings...),
 		Events:             append([]contract.RequestEvent(nil), session.events...),
 	}
@@ -1143,6 +1150,9 @@ func (session *recordSession) demoteCurrentAttemptToChild(
 	child.ChildCount = 0
 	// The root carries the turn's preview; an attempt would only repeat it.
 	child.InputPreview = nil
+	// Tool review belongs to the eventual client delivery, not discarded
+	// upstream attempts. A retry child must not keep a phantom pending review.
+	child.ToolReview = nil
 	child.Events = eventsForAttempt(session.events, session.attemptIndex)
 	child.Audit = session.upstreamAuditSummary()
 	// A failed attempt produced nothing the client will replay; only the

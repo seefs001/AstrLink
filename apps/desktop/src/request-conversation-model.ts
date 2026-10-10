@@ -639,7 +639,9 @@ function buildCall(
       children.length > 0 ||
       toolCalls.some((tool) => tool.isError) ||
       fallback > 0 ||
-      conversionError,
+      conversionError ||
+      (record.tool_review !== undefined &&
+        !["passed", "not_applicable"].includes(record.tool_review.status)),
     reply: false,
     reason: callReason(record, children),
     narration: parsed

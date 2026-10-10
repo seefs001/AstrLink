@@ -128,6 +128,13 @@ import {
 } from "./audit-settings-model";
 import { parseLocalDataStatus, type LocalDataStatus } from "./local-data-model";
 import {
+  parseToolReviewSettingsRecord,
+  validateToolReviewETag,
+  validateToolReviewSettingsPatch,
+  type ToolReviewSettingsRecord,
+  type ToolReviewSettingsPatch,
+} from "./tool-review-settings-model";
+import {
   parseAuthorizationSession,
   parseBeginCodexAuthorizationResult,
   type AuthorizationFlow,
@@ -629,7 +636,12 @@ export async function listRequestRecords(
   requireNativeBridge();
   return parseRequestRecordPage(
     await invoke<unknown>("list_request_records", {
-      query: compactQuery(query),
+      query: {
+        ...compactQuery(query),
+        ...(query.tool_review_status === undefined
+          ? {}
+          : { tool_review_status: query.tool_review_status }),
+      },
     }),
   );
 }
@@ -977,6 +989,25 @@ export async function dismissProviderImport(id: string): Promise<void> {
 export async function listPrivacyPolicies(): Promise<PrivacyPolicyPage> {
   requireNativeBridge();
   return parsePrivacyPolicyPage(await invoke<unknown>("list_privacy_policies"));
+}
+
+export async function getToolReviewSettings(): Promise<ToolReviewSettingsRecord> {
+  requireNativeBridge();
+  return parseToolReviewSettingsRecord(
+    await invoke<unknown>("get_tool_review_settings"),
+  );
+}
+
+export async function updateToolReviewSettings(
+  etag: string,
+  patch: ToolReviewSettingsPatch,
+): Promise<ToolReviewSettingsRecord> {
+  requireNativeBridge();
+  validateToolReviewETag(etag);
+  validateToolReviewSettingsPatch(patch);
+  return parseToolReviewSettingsRecord(
+    await invoke<unknown>("update_tool_review_settings", { etag, patch }),
+  );
 }
 
 export async function getPrivacyPolicy(): Promise<PrivacyPolicyRecord> {

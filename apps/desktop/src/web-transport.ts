@@ -1,5 +1,10 @@
 import { i18n } from "./i18n";
 import { webText } from "./web-copy";
+import {
+  parseToolReviewSettingsRecord,
+  validateToolReviewETag,
+  validateToolReviewSettingsPatch,
+} from "./tool-review-settings-model";
 
 export const CONSOLE_SIGNED_OUT = "astrlink:console-signed-out";
 export const RAW_CHANGED = "astrlink:web-raw-changed";
@@ -97,7 +102,7 @@ function route(
   path: string | ((a: Args) => string),
   method: Method = "GET",
   body?: (a: Args) => unknown,
-  wrap?: "service" | "policy" | "order",
+  wrap?: "service" | "policy" | "order" | "settings",
 ): Command {
   return async (a) => {
     const result = await consoleRequest(
@@ -115,6 +120,32 @@ function route(
 }
 const input = (a: Args) => a.input;
 const patch = (a: Args) => a.patch;
+async function toolReviewSettings(a: Args, method: "GET" | "PATCH") {
+  if (method === "PATCH") {
+    validateToolReviewETag(a.etag);
+    validateToolReviewSettingsPatch(a.patch);
+  }
+  try {
+    return parseToolReviewSettingsRecord(
+      await route(
+        "/tool-review-settings",
+        method,
+        method === "PATCH" ? patch : undefined,
+        "settings",
+      )(a),
+    );
+  } catch (error) {
+    // Match the native boundary: do not forward the server's error code,
+    // body or a network exception that could echo prompt/key material.
+    throw new Error(
+      error instanceof ConsoleError
+        ? error.status === 409 || error.status === 412
+          ? "tool_review_settings_conflict"
+          : "tool_review_settings_rejected"
+        : "tool_review_settings_unavailable",
+    );
+  }
+}
 const proof = (a: Args) =>
   a.proof ? { password: (a.proof as Args).password } : undefined;
 async function raw(path: string, body: unknown, decided = false) {
@@ -360,6 +391,8 @@ const commands: Record<string, Command> = {
   pause_privacy_model_installation: route((a) => `${model(a)}/pause`, "POST"),
   resume_privacy_model_installation: route((a) => `${model(a)}/resume`, "POST"),
   delete_privacy_model_installation: route(model, "DELETE"),
+  get_tool_review_settings: (a) => toolReviewSettings(a, "GET"),
+  update_tool_review_settings: (a) => toolReviewSettings(a, "PATCH"),
   get_routing_settings: route("/routing-settings"),
   update_routing_settings: route("/routing-settings", "PATCH", patch),
   get_client_identities: route("/client-identities"),

@@ -12,6 +12,8 @@ const bridgeMocks = vi.hoisted(() => ({
   getPrivacyModelInstallation: vi.fn(),
   getPrivacyModelReleases: vi.fn(),
   getPrivacyPolicy: vi.fn(),
+  getToolReviewSettings: vi.fn(),
+  updateToolReviewSettings: vi.fn(),
   getPrivacyRegexBuiltinRules: vi.fn(),
   getRawSealingStatus: vi.fn(),
   installPrivacyModel: vi.fn(),
@@ -326,6 +328,76 @@ describe("SafetyPolicy", () => {
     });
     await flush();
   }
+
+  it("opens independent tool review settings even when privacy configuration fails", async () => {
+    bridgeMocks.getPrivacyPolicy.mockRejectedValueOnce(
+      new Error("privacy unavailable"),
+    );
+    bridgeMocks.getToolReviewSettings.mockResolvedValue({
+      settings: {
+        enabled: false,
+        endpoint: "https://api.typesafe.ai/v1/systemone",
+        model: "jev-latest",
+        prompt: "{{user_request}}\n{{tool_call}}",
+        mode: "mark",
+        timeout_ms: 5000,
+        revision: "r1",
+        credential_configured: true,
+      },
+      etag,
+    });
+    await renderPolicy("tool-review-independent");
+    await openPolicySection("工具审查");
+    expect(
+      container.querySelector('[data-testid="tool-review-settings"]'),
+    ).not.toBeNull();
+    expect(bridgeMocks.getToolReviewSettings).toHaveBeenCalledOnce();
+    expect(
+      container.querySelector('[role="switch"][aria-label="启用隐私保护"]'),
+    ).toBeNull();
+    expect(
+      container.querySelector('[data-testid="tool-review-primary"]')?.className,
+    ).toContain("flex-col");
+  });
+
+  it("keeps the tool review draft when switching internal policy tabs", async () => {
+    bridgeMocks.getToolReviewSettings.mockResolvedValue({
+      settings: {
+        enabled: false,
+        endpoint: "https://api.typesafe.ai/v1/systemone",
+        model: "jev-latest",
+        prompt: "{{user_request}}\n{{tool_call}}",
+        mode: "mark",
+        timeout_ms: 5000,
+        revision: "r1",
+        credential_configured: true,
+      },
+      etag,
+    });
+    await renderPolicy("tool-review-tabs");
+    await openPolicySection("工具审查");
+    await flush();
+    await setInput("#tool-review-endpoint", "https://draft.example.com/check");
+    await setInput("#tool-review-key", "unsaved-key");
+    await openPolicySection("脱敏规则");
+    expect(
+      container
+        .querySelector('[data-testid="tool-review-settings"]')
+        ?.closest('[role="tabpanel"]')
+        ?.hasAttribute("hidden"),
+    ).toBe(true);
+    await openPolicySection("工具审查");
+    expect(
+      container.querySelectorAll('[data-testid="tool-review-settings"]'),
+    ).toHaveLength(1);
+    expect(
+      container.querySelector<HTMLInputElement>("#tool-review-endpoint")?.value,
+    ).toBe("https://draft.example.com/check");
+    expect(
+      container.querySelector<HTMLInputElement>("#tool-review-key")?.value,
+    ).toBe("unsaved-key");
+    expect(bridgeMocks.getToolReviewSettings).toHaveBeenCalledOnce();
+  });
 
   it("keeps the raw password one click away in the page header", async () => {
     bridgeMocks.getRawSealingStatus.mockResolvedValue(

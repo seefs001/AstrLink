@@ -1,3 +1,4 @@
+import { ToolReviewBadge } from "./ToolReviewDetails";
 import {
   isValidElement,
   memo,
@@ -1137,6 +1138,9 @@ const CallRow = memo(function CallRow({
           variant="ghost"
         >
           <StatusDot className="size-2" tone={dotTone(call.tone)} />
+          {call.record.tool_review ? (
+            <ToolReviewBadge summary={call.record.tool_review} />
+          ) : null}
           <span className="flex min-w-0 items-baseline gap-2 whitespace-nowrap">
             <span className="font-medium">
               {t("conversation.callNumber", { index: call.index })}

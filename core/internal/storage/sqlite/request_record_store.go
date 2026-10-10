@@ -27,7 +27,7 @@ const requestRecordSelectColumns = `
            WHERE request_record_cursors.request_id = request_records.id
            ORDER BY kind, direction, value)) AS cursors_json, first_token_ms, model_redirect_json,
     routing_decision_json, client_type, privacy_decision, privacy_findings_json, conversion_diagnostics_json,
-    first_answer_ms`
+    first_answer_ms, tool_review_json`
 
 const requestRecordInsertColumns = `
     id, parent_request_id, attempt_index, started_at, completed_at, status, input_protocol,
@@ -36,9 +36,9 @@ const requestRecordInsertColumns = `
     session_id, previous_response_id, output_response_id, input_preview, events_json, created_at,
     turn_index, session_link_json, turn_user_messages, turn_user_fingerprint, recovery_json, first_token_ms,
     model_redirect_json, routing_decision_json, client_type, privacy_decision, privacy_findings_json,
-    conversion_diagnostics_json, first_answer_ms`
+    conversion_diagnostics_json, first_answer_ms, tool_review_json`
 
-const requestRecordInsertValues = `(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+const requestRecordInsertValues = `(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 func (row requestRecordRow) insertArgs() []any {
 	return []any{
@@ -49,7 +49,7 @@ func (row requestRecordRow) insertArgs() []any {
 		row.outputResponseID, row.inputPreview, row.eventsJSON, row.createdAt,
 		row.turnIndex, row.sessionLinkJSON, row.turnUserMessages, row.turnUserFingerprint, row.recoveryJSON, row.firstTokenMs,
 		row.modelRedirectJSON, row.routingDecisionJSON, row.clientType, row.privacyDecision, row.privacyFindingsJSON,
-		row.conversionDiagnosticsJSON, row.firstAnswerMs,
+		row.conversionDiagnosticsJSON, row.firstAnswerMs, row.toolReviewJSON,
 	}
 }
 
@@ -141,7 +141,11 @@ ON CONFLICT(id) DO UPDATE SET
     client_type = excluded.client_type,
     privacy_decision = excluded.privacy_decision,
     privacy_findings_json = excluded.privacy_findings_json,
-    conversion_diagnostics_json = excluded.conversion_diagnostics_json
+    conversion_diagnostics_json = excluded.conversion_diagnostics_json,
+    tool_review_json = CASE
+        WHEN json_extract(request_records.tool_review_json, '$.status') <> 'pending' THEN request_records.tool_review_json
+        ELSE COALESCE(excluded.tool_review_json, request_records.tool_review_json)
+    END
 WHERE request_records.status = 'pending' OR excluded.status <> 'pending'`,
 		row.insertArgs()...,
 	)
@@ -245,6 +249,13 @@ WHERE status = 'pending'`, completedAt, errorJSON)
 usage_json=CASE WHEN usage_json IS NOT NULL AND usage_json<>'null' THEN json_set(usage_json,'$.billing_incomplete',json('true')) ELSE usage_json END
 WHERE terminal=0`); err != nil {
 		return 0, fmt.Errorf("recover pending billing entries: %w", err)
+	}
+	// Review work may outlive an already successful delivery in mark mode.
+	// Recover every pending review, not just pending requests.
+	if _, err = transaction.ExecContext(ctx, `UPDATE request_records SET tool_review_json = json_set(
+    tool_review_json, '$.status', 'interrupted', '$.completed_at', ?, '$.error_code', 'core_interrupted'
+) WHERE json_extract(tool_review_json, '$.status') = 'pending'`, completedAt); err != nil {
+		return 0, fmt.Errorf("recover pending tool reviews: %w", err)
 	}
 	if _, err = transaction.ExecContext(ctx, settlePending); err != nil {
 		return 0, fmt.Errorf("recover pending audit exposure: %w", err)
@@ -380,6 +391,13 @@ func (store *Store) ListRequestRecords(
 	query.WriteString(`SELECT` + requestRecordSelectColumns + `
 FROM request_records WHERE parent_request_id IS NULL`)
 	args := make([]any, 0, 12)
+	if options.ToolReviewStatus != "" {
+		if !contract.ValidToolReviewStatus(options.ToolReviewStatus) {
+			return storagecontract.RequestRecordPage{}, fmt.Errorf("%w: invalid tool review status", storagecontract.ErrInvalidArgument)
+		}
+		query.WriteString(` AND json_extract(tool_review_json, '$.status') = ?`)
+		args = append(args, options.ToolReviewStatus)
+	}
 	if options.From != nil {
 		query.WriteString(` AND started_at >= ?`)
 		args = append(args, options.From.UTC().Format(time.RFC3339Nano))
@@ -646,6 +664,7 @@ type requestRecordRow struct {
 	privacyDecision           any
 	privacyFindingsJSON       any
 	conversionDiagnosticsJSON any
+	toolReviewJSON            any
 }
 
 func encodeRequestRecordRow(record contract.RequestRecord, createdAt time.Time) (requestRecordRow, error) {
@@ -662,6 +681,17 @@ func encodeRequestRecordRow(record contract.RequestRecord, createdAt time.Time) 
 		streaming:     boolToInt(record.Streaming),
 		auditJSON:     string(auditJSON),
 		createdAt:     createdAt.Format(time.RFC3339Nano),
+	}
+	if record.ToolReview != nil {
+		summary := *record.ToolReview
+		if summary.Calls == nil {
+			summary.Calls = []contract.ToolReviewCall{}
+		}
+		encoded, err := json.Marshal(summary)
+		if err != nil {
+			return requestRecordRow{}, fmt.Errorf("encode tool review summary: %w", err)
+		}
+		row.toolReviewJSON = string(encoded)
 	}
 	if record.ClientType != "" {
 		row.clientType = string(record.ClientType)
@@ -809,7 +839,7 @@ type scannable interface {
 
 func scanRequestRecord(row scannable) (contract.RequestRecord, error) {
 	var recoveryJSON, modelRedirectJSON, routingDecisionJSON, clientType sql.NullString
-	var privacyDecision, privacyFindingsJSON, conversionDiagnosticsJSON sql.NullString
+	var privacyDecision, privacyFindingsJSON, conversionDiagnosticsJSON, toolReviewJSON sql.NullString
 	var firstTokenMs, firstAnswerMs sql.NullInt64
 	var (
 		id, startedAt, status, inputProtocol, auditJSON, createdAt        string
@@ -830,7 +860,7 @@ func scanRequestRecord(row scannable) (contract.RequestRecord, error) {
 		&sessionID, &previousResponseID, &outputResponseID, &inputPreview, &eventsJSON,
 		&createdAt, &turnIndex, &sessionLinkJSON, &turnUserMessages, &turnUserFingerprint, &recoveryJSON, &childCount, &cursorsJSON, &firstTokenMs,
 		&modelRedirectJSON, &routingDecisionJSON, &clientType, &privacyDecision, &privacyFindingsJSON,
-		&conversionDiagnosticsJSON, &firstAnswerMs,
+		&conversionDiagnosticsJSON, &firstAnswerMs, &toolReviewJSON,
 	); err != nil {
 		return contract.RequestRecord{}, err
 	}
@@ -847,6 +877,14 @@ func scanRequestRecord(row scannable) (contract.RequestRecord, error) {
 		Status:        contract.RequestStatus(status),
 		InputProtocol: contract.ProtocolID(inputProtocol),
 		Streaming:     streaming != 0,
+	}
+	if toolReviewJSON.Valid {
+		if err := json.Unmarshal([]byte(toolReviewJSON.String), &record.ToolReview); err != nil {
+			return record, fmt.Errorf("%w: tool review metadata", storagecontract.ErrInvalidRecord)
+		}
+		if record.ToolReview != nil && record.ToolReview.Calls == nil {
+			record.ToolReview.Calls = []contract.ToolReviewCall{}
+		}
 	}
 	if recoveryJSON.Valid {
 		if err := json.Unmarshal([]byte(recoveryJSON.String), &record.Recovery); err != nil {

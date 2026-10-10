@@ -752,6 +752,13 @@ func (handler *Handler) executeCandidatesWithTest(
 		} else {
 			forwardErr = handler.forwarder.Forward(startWriter, attemptRequest, forwardTarget)
 		}
+		normalEOF := forwardErr == nil
+		// The client review gate can finish at a protocol terminal without
+		// waiting for an upstream HTTP connection to close. This is not a
+		// transport failure and must never trigger another generation.
+		if errors.Is(forwardErr, errToolReviewComplete) {
+			forwardErr = nil
+		}
 		if test != nil {
 			var responseErr *transport.ResponseError
 			if errors.As(forwardErr, &responseErr) {
@@ -771,12 +778,12 @@ func (handler *Handler) executeCandidatesWithTest(
 		timedOut := attemptContext.TimedOut()
 		relayConversionFailed := false
 		if codexAggregate != nil && retryHTTP == nil && forwardErr == nil {
-			if finishErr := codexAggregate.Finish(); finishErr != nil {
+			if finishErr := codexAggregate.Finish(); finishErr != nil && !errors.Is(finishErr, errToolReviewComplete) {
 				forwardErr = transport.NewResponseError(finishErr)
 			}
 		}
 		if relayWriter != nil && forwardErr == nil {
-			if finishErr := relayWriter.Finish(); finishErr != nil {
+			if finishErr := relayWriter.Finish(); finishErr != nil && !errors.Is(finishErr, errToolReviewComplete) {
 				forwardErr = transport.NewResponseError(finishErr)
 				relayConversionFailed = !downstream.Committed()
 			}
@@ -785,7 +792,7 @@ func (handler *Handler) executeCandidatesWithTest(
 			recordSession.noteConversionDiagnostics(contract.ConversionDiagnosticPhaseResponse, relayWriter.responseDiagnostics())
 		}
 		if retryHTTP == nil && restoring != nil && (forwardErr == nil || classified.Streaming) {
-			if finishErr := restoring.Finish(); finishErr != nil && forwardErr == nil {
+			if finishErr := restoring.Finish(); finishErr != nil && !errors.Is(finishErr, errToolReviewComplete) && forwardErr == nil {
 				forwardErr = transport.NewResponseError(finishErr)
 			}
 		}
@@ -827,15 +834,23 @@ func (handler *Handler) executeCandidatesWithTest(
 		if forwardErr == nil {
 			if session := recordSessionFromContext(request.Context()); session != nil {
 				session.noteServed(candidate, plan)
-				session.noteSucceeded()
-				if session.status == contract.RequestStatusSucceeded {
-					session.noteRecoveryStop("succeeded")
-					if test == nil {
-						// The client may already be gone after a delivered response.
-						rememberContext := context.WithoutCancel(request.Context())
-						handler.rememberResponseAffinity(rememberContext, session, candidate, plan)
-						handler.rememberChannelBinding(rememberContext, session, candidate)
+				session.toolReviewEOF = normalEOF && request.Context().Err() == nil
+				succeeded := func() {
+					session.noteSucceeded()
+					if session.status == contract.RequestStatusSucceeded {
+						session.noteRecoveryStop("succeeded")
+						if test == nil {
+							// The client may already be gone after a delivered response.
+							rememberContext := context.WithoutCancel(request.Context())
+							handler.rememberResponseAffinity(rememberContext, session, candidate, plan)
+							handler.rememberChannelBinding(rememberContext, session, candidate)
+						}
 					}
+				}
+				if session.toolReview != nil {
+					session.afterToolReview = succeeded
+				} else {
+					succeeded()
 				}
 			}
 			return

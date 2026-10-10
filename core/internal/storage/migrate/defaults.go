@@ -873,5 +873,18 @@ WHEN NEW.layout = 'whole' AND OLD.layout <> 'whole' BEGIN
 END`,
 			`UPDATE audit_settings SET request_body_max_bytes = 33554432 WHERE request_body_max_bytes = 1048576`,
 		}},
+		{Version: 50, Name: "tool_review_settings_and_records", Statements: []string{
+			`CREATE TABLE tool_review_settings (
+    id INTEGER PRIMARY KEY CHECK(id = 1),
+    document_json TEXT NOT NULL
+)`,
+			`INSERT INTO tool_review_settings (id, document_json) VALUES (1, '{"revision":"0"}')`,
+			`CREATE TABLE tool_review_credentials (
+    id INTEGER PRIMARY KEY REFERENCES tool_review_settings(id) ON DELETE CASCADE CHECK(id = 1),
+    credential_value BLOB NOT NULL CHECK(length(credential_value) BETWEEN 30 AND 16413)
+)`,
+			`ALTER TABLE request_records ADD COLUMN tool_review_json TEXT`,
+			`CREATE INDEX request_records_tool_review_status_idx ON request_records (json_extract(tool_review_json, '$.status'))`,
+		}},
 	}
 }

@@ -27,6 +27,7 @@ type builtinInternal struct {
 	Model         string
 	Target        contract.ServiceID
 	Native        bool
+	CodexTurn     *codexTurnBinding
 }
 
 func builtinInternalFrom(ctx context.Context) *builtinInternal {
@@ -89,6 +90,12 @@ func (handler *Handler) tryBuiltinTools(writer http.ResponseWriter, request *htt
 		}
 	}}
 	err = runner.Run(ctx, writer, string(principal), input, settings.BuiltinTools)
+	// Internal model success is not client delivery. The outer handler publishes
+	// this binding only after its review gate and delivery have succeeded.
+	session.mappedCodexTurn = mainMode.CodexTurn
+	if errors.Is(err, errToolReviewComplete) {
+		err = nil
+	}
 	if err != nil {
 		var streamed *builtintools.StreamFailure
 		if !errors.As(err, &streamed) {
@@ -99,7 +106,12 @@ func (handler *Handler) tryBuiltinTools(writer http.ResponseWriter, request *htt
 			session.noteCancelled()
 		}
 	} else if session.status == contract.RequestStatusPending {
-		session.noteSucceeded()
+		session.toolReviewEOF = ctx.Err() == nil
+		if session.toolReview != nil {
+			session.afterToolReview = session.noteSucceeded
+		} else {
+			session.noteSucceeded()
+		}
 	}
 	return true
 }

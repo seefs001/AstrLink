@@ -485,6 +485,7 @@ type RequestRecord struct {
 	Error          *ErrorSummary          `json:"error"`
 	Audit          AuditRecordSummary     `json:"audit"`
 	PrivacyRestore *PrivacyRestoreSummary `json:"privacy_restore"`
+	ToolReview     *ToolReviewSummary     `json:"tool_review,omitempty"`
 	// PrivacyDecision is nil on historical records and while the decision is
 	// still pending.
 	PrivacyDecision    *PrivacyDecision `json:"privacy_decision,omitempty"`
@@ -515,6 +516,11 @@ type RequestRecord struct {
 }
 
 func (record RequestRecord) Validate() error {
+	if record.ToolReview != nil {
+		if err := record.ToolReview.Validate(); err != nil {
+			return err
+		}
+	}
 	if record.ClientType != "" && !record.ClientType.Valid() {
 		return fmt.Errorf("unknown client type %q", record.ClientType)
 	}

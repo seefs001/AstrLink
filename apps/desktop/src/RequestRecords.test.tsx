@@ -3838,6 +3838,133 @@ describe("RequestRecords", () => {
     expect(window.confirm).not.toHaveBeenCalled();
   });
 
+  it("offers request-level server review filtering without extending session queries", async () => {
+    bridgeMocks.listRequestRecords.mockResolvedValue({
+      items: [firstRecord],
+      next_cursor: null,
+    });
+    await renderRecords();
+    const tab = Array.from(
+      container.querySelectorAll<HTMLButtonElement>('[role="tab"]'),
+    ).find((item) => item.textContent === "按请求审查")!;
+    await act(async () =>
+      tab.dispatchEvent(
+        new MouseEvent("mousedown", { bubbles: true, button: 0 }),
+      ),
+    );
+    expect(
+      container.querySelector('[data-testid="tool-review-records"]'),
+    ).not.toBeNull();
+    expect(bridgeMocks.listRequestRecords).toHaveBeenCalledWith(
+      expect.objectContaining({ limit: 50 }),
+    );
+    expect(
+      bridgeMocks.listRequestSessions.mock.calls.every(
+        ([query]) => !("tool_review_status" in query),
+      ),
+    ).toBe(true);
+  });
+
+  it("refreshes pending child reviews without changing the attempt count", async () => {
+    vi.useFakeTimers();
+    const rootRecord = { ...firstRecord, child_count: 1 };
+    let child: RequestRecord = {
+      ...firstRecord,
+      id: "req_child_review",
+      parent_request_id: firstRecord.id,
+      tool_review: {
+        status: "pending",
+        mode: "mark",
+        model: "jev-latest",
+        config_revision: "r1",
+        started_at: firstRecord.started_at,
+        latency_ms: 0,
+        calls: [],
+      },
+    };
+    bridgeMocks.listRequestSessions.mockResolvedValue({
+      items: [sessionFromRecord(rootRecord)],
+      next_cursor: null,
+    });
+    bridgeMocks.getRequestSession.mockResolvedValue(sessionDetail(rootRecord));
+    bridgeMocks.listRequestRecordChildren.mockImplementation(async () => ({
+      items: [child],
+      next_cursor: null,
+    }));
+    await renderRecords();
+    await act(async () =>
+      (
+        container.querySelector(
+          `[data-session-id="${firstRecord.id}"]`,
+        ) as HTMLButtonElement
+      ).click(),
+    );
+    child = {
+      ...child,
+      tool_review: { ...child.tool_review!, status: "flagged" },
+    };
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1000);
+    });
+    expect(
+      bridgeMocks.listRequestRecordChildren.mock.calls.length,
+    ).toBeGreaterThan(1);
+    const count = bridgeMocks.listRequestRecordChildren.mock.calls.length;
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3000);
+    });
+    expect(bridgeMocks.listRequestRecordChildren.mock.calls.length).toBe(count);
+  });
+
+  it("keeps polling a completed request while its independent review is pending", async () => {
+    vi.useFakeTimers();
+    let latest: RequestRecord = {
+      ...firstRecord,
+      tool_review: {
+        status: "pending",
+        mode: "mark",
+        model: "jev-latest",
+        config_revision: "r1",
+        started_at: firstRecord.started_at,
+        latency_ms: 0,
+        calls: [],
+      },
+    };
+    bridgeMocks.listRequestSessions.mockResolvedValue({
+      items: [sessionFromRecord(latest)],
+      next_cursor: null,
+    });
+    bridgeMocks.getRequestSession.mockImplementation(async () =>
+      sessionDetail(latest),
+    );
+    await renderRecords();
+    await act(async () =>
+      (
+        container.querySelector(
+          `[data-session-id="${firstRecord.id}"]`,
+        ) as HTMLButtonElement
+      ).click(),
+    );
+    expect(container.textContent).toContain("审查中");
+    latest = {
+      ...latest,
+      tool_review: {
+        ...latest.tool_review!,
+        status: "flagged",
+        latency_ms: 25,
+      },
+    };
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1000);
+    });
+    expect(container.textContent).toContain("审查命中");
+    const count = bridgeMocks.getRequestSession.mock.calls.length;
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3000);
+    });
+    expect(bridgeMocks.getRequestSession.mock.calls.length).toBe(count);
+  });
+
   it("updates a pending detail in place while queuing new requests off-monitor", async () => {
     vi.useFakeTimers();
     const pending: RequestRecord = {

@@ -1,4 +1,9 @@
 import { i18n } from "./i18n";
+import {
+  parseToolReviewSummary,
+  type ToolReviewSummary,
+  type ToolReviewStatus,
+} from "./tool-review-record-model";
 
 export const CLIENT_TYPES = [
   "unknown",
@@ -210,6 +215,7 @@ export interface RequestRecovery {
 }
 
 export interface RequestRecord {
+  tool_review?: ToolReviewSummary;
   /** Original inbound client; absent on historical records. */
   client_type?: ClientType;
   recovery?: RequestRecovery;
@@ -326,6 +332,7 @@ export interface RequestRecordPage {
 }
 
 export interface RequestRecordListQuery {
+  tool_review_status?: ToolReviewStatus;
   limit?: number;
   cursor?: string;
   from?: string;
@@ -870,6 +877,9 @@ function parseRequestRecordAt(value: unknown, path: string): RequestRecord {
   if (childCount < 0) invalid(`${path}.child_count`, "不得为负数");
 
   return {
+    ...(record.tool_review == null
+      ? {}
+      : { tool_review: parseToolReviewSummary(record.tool_review) }),
     ...(record.recovery === undefined
       ? {}
       : { recovery: parseRecovery(record.recovery, `${path}.recovery`) }),

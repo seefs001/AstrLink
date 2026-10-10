@@ -1,5 +1,6 @@
 import { useWorkspaceSnapshot } from "./workspace-snapshots";
 import { SessionChannelBindings } from "./SessionChannelBindings";
+import { ToolReviewRecords } from "./ToolReviewRecords";
 import { RecoveryChain, RecoveryDetails } from "./components/RecoveryDetails";
 import {
   memo,
@@ -276,6 +277,7 @@ function sessionDetailKey(detail: RequestSessionDetail): string {
       turn.completed_at ?? "",
       turn.child_count,
       turn.events.length,
+      JSON.stringify(turn.tool_review ?? null),
       turn.audit.request_body_captured ? "1" : "0",
       turn.audit.response_content_captured ? "1" : "0",
       turn.audit.upstream_request_body_captured ? "1" : "0",
@@ -317,6 +319,7 @@ export function RequestRecords({
   );
   const [view, setView] = useState<RecordsView>("monitor");
   const [kind, setKind] = useState<RecordsKind>("inference");
+  const [requestReviewView, setRequestReviewView] = useState(false);
   const [filters, setFilters] = useState<RecordFilters>(() => ({
     ...EMPTY_FILTERS,
     localAccessTokenIds: initialLocalAccessTokenId
@@ -458,7 +461,10 @@ export function RequestRecords({
   const detailIsLive =
     selectedId !== null &&
     (selectedSession?.status === "pending" ||
-      selectedTurns.some((turn) => turn.status === "pending"));
+      selectedTurns.some(
+        (turn) =>
+          turn.status === "pending" || turn.tool_review?.status === "pending",
+      ));
 
   useEffect(() => {
     if (!selectedId) return;
@@ -1381,8 +1387,10 @@ export function RequestRecords({
           aria-labelledby="request-records-heading"
           className="flex h-full min-h-0 min-w-0 flex-1 flex-col gap-0 overflow-hidden"
           hidden={view !== "monitor"}
-          value={kind}
+          value={requestReviewView ? "requests" : kind}
           onValueChange={(value) => {
+            setRequestReviewView(value === "requests");
+            if (value === "requests") return;
             setKind(value as RecordsKind);
             setFilters((current) => ({ ...current, protocol: "" }));
             setError(null);
@@ -1391,6 +1399,7 @@ export function RequestRecords({
           <ScrollWorkspace
             className="gap-0"
             contentAsChild
+            contentClassName="overflow-hidden"
             headerClassName="gap-0"
             header={
               <>
@@ -1484,234 +1493,255 @@ export function RequestRecords({
                   <TabsTrigger className="flex-none" value="all">
                     {t("common.all")}
                   </TabsTrigger>
+                  <TabsTrigger className="flex-none" value="requests">
+                    {t("toolReview.requestsTab")}
+                  </TabsTrigger>
                 </TabsList>
-                {error ? (
-                  <FormMessage className="mt-2.5 shrink-0" tone="error">
-                    {error}
-                  </FormMessage>
+                {!requestReviewView ? (
+                  <>
+                    {error ? (
+                      <FormMessage className="mt-2.5 shrink-0" tone="error">
+                        {error}
+                      </FormMessage>
+                    ) : null}
+                    {syncWarning ? (
+                      <FormMessage
+                        className="mt-2.5 flex shrink-0 items-center gap-2"
+                        tone="warning"
+                      >
+                        <StatusDot tone="pending" />
+                        {syncWarning}
+                      </FormMessage>
+                    ) : null}
+                    <div className="flex w-full min-w-0 flex-wrap items-center gap-2 border-b bg-background py-2">
+                      <div className="grid min-w-0 flex-1 basis-72 grid-cols-3 gap-2 @[680px]:max-w-4xl @[680px]:grid-cols-5">
+                        <FilterSelect
+                          ariaLabel={t("records.filter", {
+                            label: t("records.status"),
+                          })}
+                          className="w-full"
+                          label={t("records.status")}
+                          onChange={(status) =>
+                            setFilters((current) => ({
+                              ...current,
+                              status: status as SessionStatus | "",
+                            }))
+                          }
+                          options={[
+                            { label: t("common.all"), value: "" },
+                            ...STATUSES.map((status) => ({
+                              label: statusLabel(status),
+                              value: status,
+                            })),
+                          ]}
+                          value={filters.status}
+                        />
+                        <ServiceSelect
+                          ariaLabel={t("records.filter", {
+                            label: t("records.providerFilter"),
+                          })}
+                          className="w-full"
+                          label={t("records.providerFilter")}
+                          onChange={(serviceId) =>
+                            setFilters((current) => ({ ...current, serviceId }))
+                          }
+                          allLabel={t("common.all")}
+                          services={services}
+                          value={filters.serviceId}
+                        />
+                        <FilterSelect
+                          ariaLabel={t("records.filter", {
+                            label: t("records.protocol"),
+                          })}
+                          className="w-full"
+                          label={t("records.protocol")}
+                          onChange={(protocol) =>
+                            setFilters((current) => ({ ...current, protocol }))
+                          }
+                          options={[
+                            { label: t("common.all"), value: "" },
+                            ...protocolOptions.map((protocol) => ({
+                              label: protocolEntryPath(protocol),
+                              value: protocol,
+                            })),
+                          ]}
+                          value={filters.protocol}
+                        />
+                        <FilterSelect
+                          ariaLabel={t("records.filter", {
+                            label: t("records.client"),
+                          })}
+                          className="w-full"
+                          label={t("records.client")}
+                          onChange={(clientType) =>
+                            setFilters((current) => ({
+                              ...current,
+                              clientType: clientType as ClientType | "",
+                            }))
+                          }
+                          options={[
+                            { label: t("common.all"), value: "" },
+                            ...clientOptions.map((clientType) => ({
+                              label: clientTypeName(clientType),
+                              value: clientType,
+                              displayLabel: (
+                                <span className="inline-flex min-w-0 items-center gap-2">
+                                  <ClientTypeIcon
+                                    clientType={clientType}
+                                    decorative
+                                    size={16}
+                                  />
+                                  <span className="truncate">
+                                    {clientTypeName(clientType)}
+                                  </span>
+                                </span>
+                              ),
+                            })),
+                          ]}
+                          value={filters.clientType}
+                        />
+                        <MultiFilterSelect
+                          allLabel={t("common.all")}
+                          ariaLabel={t("records.filter", {
+                            label: t("records.accessToken"),
+                          })}
+                          className="w-full"
+                          clearLabel={t("records.clearTokenFilter")}
+                          disabled={!isReady || !accessTokensReady}
+                          emptyMessage={t("records.noAccessTokenResults")}
+                          label={t("records.accessToken")}
+                          onChange={(localAccessTokenIds) =>
+                            setFilters((current) => ({
+                              ...current,
+                              localAccessTokenIds,
+                            }))
+                          }
+                          options={accessTokenOptions}
+                          searchPlaceholder={t("records.searchAccessTokens")}
+                          selectAllLabel={t("records.selectAllTokens")}
+                          selectedCountLabel={(count) =>
+                            t("records.selectedTokens", { count })
+                          }
+                          value={filters.localAccessTokenIds}
+                        />
+                      </div>
+                      <IconButton
+                        className="ml-auto"
+                        variant="outline"
+                        disabled={!isReady || listStatus === "loading"}
+                        label={t("common.refresh")}
+                        onClick={() => manualPollRef.current?.()}
+                        type="button"
+                      >
+                        <RefreshCw aria-hidden="true" />
+                      </IconButton>
+                    </div>
+                  </>
                 ) : null}
-                {syncWarning ? (
-                  <FormMessage
-                    className="mt-2.5 flex shrink-0 items-center gap-2"
-                    tone="warning"
-                  >
-                    <StatusDot tone="pending" />
-                    {syncWarning}
-                  </FormMessage>
-                ) : null}
-                <div className="flex w-full min-w-0 flex-wrap items-center gap-2 border-b bg-background py-2">
-                  <div className="grid min-w-0 flex-1 basis-72 grid-cols-3 gap-2 @[680px]:max-w-4xl @[680px]:grid-cols-5">
-                    <FilterSelect
-                      ariaLabel={t("records.filter", {
-                        label: t("records.status"),
-                      })}
-                      className="w-full"
-                      label={t("records.status")}
-                      onChange={(status) =>
-                        setFilters((current) => ({
-                          ...current,
-                          status: status as SessionStatus | "",
-                        }))
-                      }
-                      options={[
-                        { label: t("common.all"), value: "" },
-                        ...STATUSES.map((status) => ({
-                          label: statusLabel(status),
-                          value: status,
-                        })),
-                      ]}
-                      value={filters.status}
-                    />
-                    <ServiceSelect
-                      ariaLabel={t("records.filter", {
-                        label: t("records.providerFilter"),
-                      })}
-                      className="w-full"
-                      label={t("records.providerFilter")}
-                      onChange={(serviceId) =>
-                        setFilters((current) => ({ ...current, serviceId }))
-                      }
-                      allLabel={t("common.all")}
-                      services={services}
-                      value={filters.serviceId}
-                    />
-                    <FilterSelect
-                      ariaLabel={t("records.filter", {
-                        label: t("records.protocol"),
-                      })}
-                      className="w-full"
-                      label={t("records.protocol")}
-                      onChange={(protocol) =>
-                        setFilters((current) => ({ ...current, protocol }))
-                      }
-                      options={[
-                        { label: t("common.all"), value: "" },
-                        ...protocolOptions.map((protocol) => ({
-                          label: protocolEntryPath(protocol),
-                          value: protocol,
-                        })),
-                      ]}
-                      value={filters.protocol}
-                    />
-                    <FilterSelect
-                      ariaLabel={t("records.filter", {
-                        label: t("records.client"),
-                      })}
-                      className="w-full"
-                      label={t("records.client")}
-                      onChange={(clientType) =>
-                        setFilters((current) => ({
-                          ...current,
-                          clientType: clientType as ClientType | "",
-                        }))
-                      }
-                      options={[
-                        { label: t("common.all"), value: "" },
-                        ...clientOptions.map((clientType) => ({
-                          label: clientTypeName(clientType),
-                          value: clientType,
-                          displayLabel: (
-                            <span className="inline-flex min-w-0 items-center gap-2">
-                              <ClientTypeIcon
-                                clientType={clientType}
-                                decorative
-                                size={16}
-                              />
-                              <span className="truncate">
-                                {clientTypeName(clientType)}
-                              </span>
-                            </span>
-                          ),
-                        })),
-                      ]}
-                      value={filters.clientType}
-                    />
-                    <MultiFilterSelect
-                      allLabel={t("common.all")}
-                      ariaLabel={t("records.filter", {
-                        label: t("records.accessToken"),
-                      })}
-                      className="w-full"
-                      clearLabel={t("records.clearTokenFilter")}
-                      disabled={!isReady || !accessTokensReady}
-                      emptyMessage={t("records.noAccessTokenResults")}
-                      label={t("records.accessToken")}
-                      onChange={(localAccessTokenIds) =>
-                        setFilters((current) => ({
-                          ...current,
-                          localAccessTokenIds,
-                        }))
-                      }
-                      options={accessTokenOptions}
-                      searchPlaceholder={t("records.searchAccessTokens")}
-                      selectAllLabel={t("records.selectAllTokens")}
-                      selectedCountLabel={(count) =>
-                        t("records.selectedTokens", { count })
-                      }
-                      value={filters.localAccessTokenIds}
-                    />
-                  </div>
-                  <IconButton
-                    className="ml-auto"
-                    variant="outline"
-                    disabled={!isReady || listStatus === "loading"}
-                    label={t("common.refresh")}
-                    onClick={() => manualPollRef.current?.()}
-                    type="button"
-                  >
-                    <RefreshCw aria-hidden="true" />
-                  </IconButton>
-                </div>
               </>
             }
           >
-            <TabsContent
-              value={kind}
-              className="@container/request-list min-h-0 min-w-0 flex-1 overflow-x-hidden overflow-y-auto overscroll-contain"
-              data-testid="request-records-scroll"
-              onScroll={(event) => {
-                atTopRef.current = event.currentTarget.scrollTop <= 8;
-              }}
-              ref={monitorScrollRef}
-            >
-              <div className="sticky top-0 z-7">
-                {/* Keep queued updates at the top of the list without taking up row space. */}
-                {queuedVisibleCount > 0 ? (
-                  <div className="relative">
-                    <Button
-                      className="absolute top-2 left-1/2 -translate-x-1/2 shadow-md"
-                      onClick={applyQueue}
-                      size="sm"
-                      type="button"
-                    >
-                      {t("records.newRecords", { count: queuedVisibleCount })}
-                    </Button>
-                  </div>
-                ) : null}
-              </div>
-
-              {!isReady || listStatus === "blocked" ? (
-                <EmptyState
-                  className="my-4 min-h-64"
-                  title={t("records.waitingReady")}
-                  description={t("records.waitingHint")}
+            <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+              <TabsContent
+                value="requests"
+                className="min-h-0 min-w-0 flex-1 overflow-hidden"
+              >
+                <ToolReviewRecords
+                  coreSessionKey={coreSessionKey}
+                  isReady={isReady}
+                  localAccessTokenIds={filters.localAccessTokenIds}
                 />
-              ) : listStatus === "error" && listError ? (
-                <EmptyState
-                  className="my-4 min-h-64"
-                  title={t("records.readFailedTitle")}
-                  description={listError}
-                />
-              ) : listStatus === "loading" && live.items.length === 0 ? (
-                <RecordSkeleton />
-              ) : visibleItems.length === 0 ? (
-                <EmptyState
-                  className="my-4 min-h-64"
-                  title={t(
-                    kind === "discovery"
-                      ? "records.emptyDiscovery"
-                      : kind === "inference"
-                        ? "records.emptyInference"
-                        : "records.empty",
-                  )}
-                  action={
-                    filters.status ||
-                    filters.serviceId ||
-                    filters.protocol ||
-                    filters.clientType ||
-                    filters.localAccessTokenIds.length ? (
+              </TabsContent>
+              <TabsContent
+                value={kind}
+                className="@container/request-list min-h-0 min-w-0 flex-1 overflow-x-hidden overflow-y-auto overscroll-contain"
+                data-testid="request-records-scroll"
+                onScroll={(event) => {
+                  atTopRef.current = event.currentTarget.scrollTop <= 8;
+                }}
+                ref={monitorScrollRef}
+              >
+                <div className="sticky top-0 z-7">
+                  {/* Keep queued updates at the top of the list without taking up row space. */}
+                  {queuedVisibleCount > 0 ? (
+                    <div className="relative">
                       <Button
-                        variant="outline"
+                        className="absolute top-2 left-1/2 -translate-x-1/2 shadow-md"
+                        onClick={applyQueue}
                         size="sm"
-                        onClick={() => setFilters(EMPTY_FILTERS)}
+                        type="button"
                       >
-                        {" "}
-                        {t("records.clearFilters")}
+                        {t("records.newRecords", { count: queuedVisibleCount })}
                       </Button>
-                    ) : undefined
-                  }
-                />
-              ) : (
-                <SessionStream
-                  onOpen={openDetail}
-                  selectedId={openingId ?? selectedId}
-                  services={servicesById}
-                  sessions={visibleItems}
-                />
-              )}
+                    </div>
+                  ) : null}
+                </div>
 
-              {live.nextCursor ? (
-                <Button
-                  className="mx-auto my-3 flex"
-                  variant="outline"
-                  disabled={loadingMore}
-                  onClick={() => void loadMore()}
-                  type="button"
-                >
-                  {loadingMore ? t("common.loading") : t("records.loadEarlier")}
-                </Button>
-              ) : null}
-            </TabsContent>
+                {!isReady || listStatus === "blocked" ? (
+                  <EmptyState
+                    className="my-4 min-h-64"
+                    title={t("records.waitingReady")}
+                    description={t("records.waitingHint")}
+                  />
+                ) : listStatus === "error" && listError ? (
+                  <EmptyState
+                    className="my-4 min-h-64"
+                    title={t("records.readFailedTitle")}
+                    description={listError}
+                  />
+                ) : listStatus === "loading" && live.items.length === 0 ? (
+                  <RecordSkeleton />
+                ) : visibleItems.length === 0 ? (
+                  <EmptyState
+                    className="my-4 min-h-64"
+                    title={t(
+                      kind === "discovery"
+                        ? "records.emptyDiscovery"
+                        : kind === "inference"
+                          ? "records.emptyInference"
+                          : "records.empty",
+                    )}
+                    action={
+                      filters.status ||
+                      filters.serviceId ||
+                      filters.protocol ||
+                      filters.clientType ||
+                      filters.localAccessTokenIds.length ? (
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          onClick={() => setFilters(EMPTY_FILTERS)}
+                        >
+                          {" "}
+                          {t("records.clearFilters")}
+                        </Button>
+                      ) : undefined
+                    }
+                  />
+                ) : (
+                  <SessionStream
+                    onOpen={openDetail}
+                    selectedId={openingId ?? selectedId}
+                    services={servicesById}
+                    sessions={visibleItems}
+                  />
+                )}
+
+                {live.nextCursor ? (
+                  <Button
+                    className="mx-auto my-3 flex"
+                    variant="outline"
+                    disabled={loadingMore}
+                    onClick={() => void loadMore()}
+                    type="button"
+                  >
+                    {loadingMore
+                      ? t("common.loading")
+                      : t("records.loadEarlier")}
+                  </Button>
+                ) : null}
+              </TabsContent>
+            </div>
           </ScrollWorkspace>
         </Tabs>
 
@@ -2239,26 +2269,47 @@ function RecordDetail({
       return;
     }
     let cancelled = false;
-    void Promise.all(
-      childRoots.map(async (turn) => {
-        const page = await listRequestRecordChildren(turn.id);
-        return [turn.id, page.items] as const;
-      }),
-    )
-      .then((entries) => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let pendingRoots = childRoots.map((turn) => turn.id);
+    let loaded: Record<string, RequestRecord[]> = {};
+    const load = async () => {
+      try {
+        const entries = await Promise.all(
+          pendingRoots.map(async (id) => {
+            const page = await listRequestRecordChildren(id);
+            return [id, page.items] as const;
+          }),
+        );
         if (cancelled) return;
-        setChildrenByRoot(Object.fromEntries(entries));
+        loaded = { ...loaded, ...Object.fromEntries(entries) };
+        setChildrenByRoot(loaded);
         const registered: Record<string, RequestRecord> = {};
         for (const [, items] of entries) {
           for (const child of items) registered[child.id] = child;
         }
         if (Object.keys(registered).length > 0) onRegisterRecords(registered);
-      })
-      .catch(() => {
-        if (!cancelled) setChildrenByRoot({});
-      });
+        pendingRoots = entries
+          .filter(([, items]) =>
+            items.some(
+              (child) =>
+                child.status === "pending" ||
+                child.tool_review?.status === "pending",
+            ),
+          )
+          .map(([id]) => id);
+      } catch {
+        // Keep the last metadata and retry only the roots still awaiting results.
+      } finally {
+        if (!cancelled && pendingRoots.length > 0)
+          timer = setTimeout(() => {
+            void load();
+          }, 1000);
+      }
+    };
+    void load();
     return () => {
       cancelled = true;
+      clearTimeout(timer);
     };
   }, [childRoots]);
 

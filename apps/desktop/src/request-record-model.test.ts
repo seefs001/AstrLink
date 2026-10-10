@@ -50,6 +50,70 @@ const fullRecord = {
   extensions: { note: "ignored" },
 };
 
+it("preserves independent tool review metadata and rejects unsafe review payloads", () => {
+  const summary = {
+    status: "flagged",
+    mode: "mark",
+    model: "jev-latest",
+    config_revision: "r1",
+    started_at: "2026-07-25T10:00:00Z",
+    completed_at: "2026-07-25T10:00:02Z",
+    latency_ms: 2000,
+    calls: [
+      {
+        index: 0,
+        name: "shell",
+        verdict: "flag",
+        pass_probability: 0,
+        flag_probability: 1,
+        action: "delivered",
+        latency_ms: 40,
+        model: "jev-latest",
+      },
+    ],
+  };
+  const parsed = parseRequestRecord({ ...fullRecord, tool_review: summary });
+  expect(parsed.status).toBe("succeeded");
+  expect(parsed.tool_review).toEqual(summary);
+  expect(
+    parseRequestRecord({ ...fullRecord, tool_review: null }).tool_review,
+  ).toBeUndefined();
+  expect(
+    parseRequestRecord({
+      ...fullRecord,
+      tool_review: { ...summary, calls: null },
+    }).tool_review?.calls,
+  ).toEqual([]);
+  // Core bounds names by characters and allows tab, so such names must parse.
+  const wideName = "工".repeat(256);
+  expect(
+    parseRequestRecord({
+      ...fullRecord,
+      tool_review: {
+        ...summary,
+        calls: [{ ...summary.calls[0], name: wideName, model: "jev\tlatest" }],
+      },
+    }).tool_review?.calls[0]?.name,
+  ).toBe(wideName);
+  for (const change of [
+    { calls: [{ ...summary.calls[0], name: "工".repeat(257) }] },
+    { calls: [{ ...summary.calls[0], name: "shell\nexec" }] },
+    { status: "safe" },
+    { api_key: "secret" },
+    { error_code: "raw upstream error" },
+    { calls: Array(65).fill(summary.calls[0]) },
+    { calls: [{ ...summary.calls[0], pass_probability: 2 }] },
+    { calls: [{ ...summary.calls[0], arguments: "private" }] },
+  ]) {
+    expect(() =>
+      parseRequestRecord({
+        ...fullRecord,
+        tool_review: { ...summary, ...change },
+      }),
+    ).toThrow();
+  }
+});
+
 const fullSession = {
   id: "session_keep",
   title: "创建快捷方式",

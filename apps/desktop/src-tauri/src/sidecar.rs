@@ -2545,6 +2545,52 @@ impl CoreManager {
         serde_json::from_slice(&body).map_err(|_| "invalid tool response".into())
     }
 
+    pub async fn get_tool_review_settings(&self) -> Result<serde_json::Value, String> {
+        self.tool_review_settings_request(Method::GET, None, None)
+            .await
+    }
+
+    pub async fn update_tool_review_settings(
+        &self,
+        etag: &str,
+        patch: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        validate_strong_etag(etag)?;
+        crate::tool_review::validate_settings(&patch, true)?;
+        self.tool_review_settings_request(Method::PATCH, Some(patch), Some(etag))
+            .await
+    }
+
+    async fn tool_review_settings_request(
+        &self,
+        method: Method,
+        patch: Option<serde_json::Value>,
+        if_match: Option<&str>,
+    ) -> Result<serde_json::Value, String> {
+        let (status, etag, body) = self
+            .authenticated_control_response(
+                method,
+                "/control/v1/tool-review-settings",
+                patch,
+                if_match,
+            )
+            .await
+            .map_err(|_| "tool_review_settings_unavailable".to_string())?;
+        // Neither endpoint responses nor configuration errors may echo the key,
+        // prompt, or an upstream error into IPC/debug logs.
+        if status == reqwest::StatusCode::PRECONDITION_FAILED
+            || status == reqwest::StatusCode::CONFLICT
+        {
+            return Err("tool_review_settings_conflict".into());
+        }
+        if !status.is_success() {
+            return Err("tool_review_settings_rejected".into());
+        }
+        let etag = etag.ok_or("tool_review_settings_missing_etag")?;
+        validate_strong_etag(&etag)?;
+        crate::tool_review::settings_record(etag, &body)
+    }
+
     pub async fn get_routing_settings(&self) -> Result<serde_json::Value, String> {
         let (_, body) = self
             .authenticated_control(Method::GET, "/control/v1/routing-settings", None, None)
@@ -2706,6 +2752,7 @@ impl CoreManager {
                 Err(error) => {
                     if attempt == 0
                         && !is_builtin_tool_test(&method, path)
+                        && !(method == Method::PATCH && path == "/control/v1/tool-review-settings")
                         && !crate::raw_access::is_proof_request(&method, path)
                         && is_control_transport_error(&error)
                     {
@@ -4868,6 +4915,9 @@ fn timestamp_query_charset_ok(value: &str) -> bool {
 }
 
 fn build_request_session_query(query: &serde_json::Value) -> Result<String, String> {
+    if query.get("tool_review_status").is_some() {
+        return Err("tool_review_status is only supported for request records".into());
+    }
     let mut record_query = query.clone();
     let kind = record_query
         .as_object_mut()
@@ -4903,6 +4953,7 @@ fn build_request_record_query(query: &serde_json::Value) -> Result<String, Strin
     let mut service_id: Option<&str> = None;
     let mut local_access_token_ids: Vec<&str> = Vec::new();
     let mut status: Option<&str> = None;
+    let mut tool_review_status: Option<&str> = None;
 
     for (key, value) in object {
         match key.as_str() {
@@ -4996,6 +5047,25 @@ fn build_request_record_query(query: &serde_json::Value) -> Result<String, Strin
                     _ => return Err("request record query status is invalid".to_string()),
                 }
             }
+            "tool_review_status" => {
+                let text = value
+                    .as_str()
+                    .filter(|value| {
+                        matches!(
+                            *value,
+                            "pending"
+                                | "passed"
+                                | "flagged"
+                                | "blocked"
+                                | "failed"
+                                | "interrupted"
+                                | "cancelled"
+                                | "not_applicable"
+                        )
+                    })
+                    .ok_or("invalid tool review status filter")?;
+                tool_review_status = Some(text);
+            }
             other => {
                 return Err(format!("request record query contains unknown key {other}"));
             }
@@ -5029,6 +5099,9 @@ fn build_request_record_query(query: &serde_json::Value) -> Result<String, Strin
     }
     if let Some(value) = status {
         pairs.push(format!("status={}", percent_encode_query(value)));
+    }
+    if let Some(value) = tool_review_status {
+        pairs.push(format!("tool_review_status={value}"));
     }
     if pairs.is_empty() {
         return Ok(String::new());
@@ -5867,6 +5940,102 @@ mod tests {
     }
 
     #[test]
+    fn tool_review_settings_use_operator_http_and_etag_without_exposing_error_body() {
+        use std::io::{BufRead, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let etag = format!("\"sha256:{}\"", "a".repeat(64));
+        let response_etag = etag.clone();
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for index in 0..3 {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = std::io::BufReader::new(&mut stream);
+                let mut headers = String::new();
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = value.trim().parse().unwrap();
+                    }
+                    headers.push_str(&line);
+                }
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).unwrap();
+                requests.push((headers, body));
+                let (status, body) = if index == 2 {
+                    (
+                        "412 Precondition Failed",
+                        "private upstream error key=secret".to_string(),
+                    )
+                } else {
+                    ("200 OK", serde_json::json!({"enabled":index == 1,"endpoint":"https://api.typesafe.ai/v1/systemone","model":"jev-latest","prompt":"{{user_request}}\n{{tool_call}}","mode":"mark","timeout_ms":5000,"revision":"r1","credential_configured":true}).to_string())
+                };
+                write!(stream, "HTTP/1.1 {status}\r\nETag: {response_etag}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+            requests
+        });
+        let manager = CoreManager::new();
+        {
+            let mut inner = manager.lock_inner();
+            inner.phase = CorePhase::Ready;
+            inner.control_token = Some("operator-test-token".into());
+            inner.ready = Some(ReadyAnnouncement {
+                event: "ready".into(),
+                core_version: "0.1.0".into(),
+                control_api_version: "v1".into(),
+                protocol_contract_version: "v1".into(),
+                inference_url: format!("http://{address}"),
+                client_inference_url: format!("http://{address}"),
+                control_url: format!("http://{address}"),
+            });
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let read = runtime
+            .block_on(manager.get_tool_review_settings())
+            .unwrap();
+        assert_eq!(read["etag"], etag);
+        assert!(read["settings"].get("api_key").is_none());
+        let patch = serde_json::json!({"enabled":true,"api_key":"write-only-key","data_transfer_acknowledged":true});
+        let saved = runtime
+            .block_on(manager.update_tool_review_settings(&etag, patch.clone()))
+            .unwrap();
+        assert_eq!(saved["settings"]["enabled"], true);
+        let error = runtime
+            .block_on(manager.update_tool_review_settings(&etag, patch.clone()))
+            .unwrap_err();
+        assert_eq!(error, "tool_review_settings_conflict");
+        let requests = server.join().unwrap();
+        assert!(requests[0]
+            .0
+            .starts_with("GET /control/v1/tool-review-settings "));
+        assert!(requests[0]
+            .0
+            .to_lowercase()
+            .contains("authorization: bearer operator-test-token"));
+        assert!(requests[1]
+            .0
+            .starts_with("PATCH /control/v1/tool-review-settings "));
+        assert!(requests[1]
+            .0
+            .to_lowercase()
+            .contains(&format!("if-match: {etag}")));
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&requests[1].1).unwrap(),
+            patch
+        );
+    }
+
+    #[test]
     fn builtin_tool_tests_have_separate_deadlines_and_never_retry() {
         let search = "/control/v1/builtin-tools/web_search/test";
         let image = "/control/v1/builtin-tools/image_generation/test";
@@ -6053,6 +6222,26 @@ mod tests {
             assert!(build_request_session_query(&serde_json::json!({"kind": kind})).is_err());
         }
         assert!(build_request_record_query(&serde_json::json!({"kind": "inference"})).is_err());
+    }
+
+    #[test]
+    fn tool_review_filter_is_request_only_and_validated() {
+        assert_eq!(
+            build_request_record_query(
+                &serde_json::json!({"tool_review_status":"flagged", "limit":50})
+            )
+            .unwrap(),
+            "?limit=50&tool_review_status=flagged"
+        );
+        assert!(build_request_record_query(&serde_json::json!({"tool_review_status":""})).is_err());
+        assert!(build_request_record_query(
+            &serde_json::json!({"tool_review_status":"upstream message"})
+        )
+        .is_err());
+        assert!(
+            build_request_session_query(&serde_json::json!({"tool_review_status":"flagged"}))
+                .is_err()
+        );
     }
 
     #[test]

@@ -23,6 +23,7 @@ mod recovery_path;
 mod service_proxy;
 mod sidecar;
 mod startup_window;
+mod tool_review;
 mod tray;
 mod updates;
 
@@ -1640,6 +1641,22 @@ async fn builtin_tool_action(
 }
 
 #[tauri::command]
+async fn get_tool_review_settings(
+    manager: State<'_, Arc<CoreManager>>,
+) -> Result<serde_json::Value, String> {
+    manager.get_tool_review_settings().await
+}
+
+#[tauri::command]
+async fn update_tool_review_settings(
+    etag: String,
+    patch: serde_json::Value,
+    manager: State<'_, Arc<CoreManager>>,
+) -> Result<serde_json::Value, String> {
+    manager.update_tool_review_settings(&etag, patch).await
+}
+
+#[tauri::command]
 async fn get_routing_settings(
     manager: State<'_, Arc<CoreManager>>,
 ) -> Result<serde_json::Value, String> {
@@ -2137,6 +2154,8 @@ pub fn run() {
             builtin_tool_action,
             get_routing_settings,
             update_routing_settings,
+            get_tool_review_settings,
+            update_tool_review_settings,
             get_client_identities,
             get_audit_settings,
             update_audit_settings,

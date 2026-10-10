@@ -2223,6 +2223,86 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ErrorResponse" }
+  /control/v1/tool-review-settings:
+    x-astrlink-implementation-status: implemented
+    get:
+      x-astrlink-role: observer
+      tags: [Policies]
+      operationId: getToolReviewSettings
+      summary: Read independent global client-tool review settings.
+      description: Operators receive complete non-secret settings and an ETag. Observers receive only enabled, mode, model, timeout_ms, revision and credential_configured, without endpoint, prompt or ETag. The API key is never returned.
+      responses:
+        "200":
+          description: Settings or observer-safe summary. Disabled by default.
+          headers:
+            ETag:
+              $ref: "#/components/headers/ETag"
+            Cache-Control:
+              $ref: "#/components/headers/NoStore"
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/ToolReviewSettings"
+                  - $ref: "#/components/schemas/ToolReviewSettingsSummary"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          description: Tool review settings store is unavailable.
+    patch:
+      x-astrlink-role: operator
+      tags: [Policies]
+      operationId: updateToolReviewSettings
+      summary: Atomically update tool review configuration and its sealed API key.
+      description: |
+        Requires the current strong ETag. Each successful update changes revision.
+        Omitted api_key preserves the credential; an empty string clears it.
+        Enabled settings require a key. Null and unknown fields are rejected.
+        Enabling review, or changing the endpoint while review stays enabled, requires
+        data_transfer_acknowledged=true because complete user requests and tool
+        arguments leave the device. Acknowledgement is not persisted.
+        In-flight requests retain one configuration and credential snapshot.
+        Mark mode delivers without waiting; rejection mode buffers from the first
+        client tool event and withholds the batch on any flag or review failure.
+        Only client function/custom tools are reviewed, not hosted or built-in tools.
+        Review uses fixed pass/flag choices without thresholds or automatic retries.
+        Limits are 128 KiB rendered input, 8 MiB buffered response, 64 calls,
+        120 seconds collection. Review timeout includes queue time, defaults to
+        5000 ms, and is configurable from 1 to 120000 ms.
+      parameters:
+        - $ref: "#/components/parameters/IfMatch"
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema:
+              $ref: "#/components/schemas/ToolReviewSettingsPatch"
+      responses:
+        "200":
+          description: Updated non-secret settings.
+          headers:
+            ETag:
+              $ref: "#/components/headers/ETag"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ToolReviewSettings"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "412":
+          description: The configuration changed since the supplied ETag.
+        "415":
+          description: Requires application/merge-patch+json.
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+        "428":
+          description: If-Match is required.
+        "503":
+          description: Tool review settings store is unavailable.
   /control/v1/routing-settings:
     x-astrlink-implementation-status: implemented
     get:
@@ -2421,6 +2501,11 @@ paths:
           in: query
           schema:
             $ref: "#/components/schemas/RequestStatus"
+        - name: tool_review_status
+          in: query
+          description: Match the root request's review status independently of delivery status. Historical records without review metadata do not match. Not supported on request sessions.
+          schema:
+            $ref: "#/components/schemas/ToolReviewStatus"
         - name: q
           in: query
           description: |
@@ -5947,6 +6032,190 @@ components:
           cherry_studio,
         ]
       description: Best-effort client label from original inbound headers, before upstream identity rewriting. Display metadata only; never an authenticated identity. Unknown means no recognized signature. Historical records omit this field.
+    ToolReviewMode:
+      type: string
+      enum: [mark, reject]
+    ToolReviewStatus:
+      type: string
+      enum:
+        [
+          pending,
+          passed,
+          flagged,
+          blocked,
+          failed,
+          interrupted,
+          cancelled,
+          not_applicable,
+        ]
+    ToolReviewSettingsSummary:
+      type: object
+      additionalProperties: false
+      required:
+        [enabled, mode, model, timeout_ms, revision, credential_configured]
+      properties:
+        enabled:
+          type: boolean
+          default: false
+        mode:
+          $ref: "#/components/schemas/ToolReviewMode"
+        model:
+          type: string
+          minLength: 1
+          maxLength: 256
+          default: jev-latest
+        timeout_ms:
+          type: integer
+          minimum: 1
+          maximum: 120000
+          default: 5000
+        revision:
+          type: string
+        credential_configured:
+          type: boolean
+    ToolReviewSettings:
+      type: object
+      additionalProperties: false
+      required:
+        [
+          enabled,
+          endpoint,
+          model,
+          prompt,
+          mode,
+          timeout_ms,
+          revision,
+          credential_configured,
+        ]
+      properties:
+        enabled:
+          type: boolean
+          default: false
+        endpoint:
+          type: string
+          format: uri
+          maxLength: 4096
+          default: https://api.typesafe.ai/v1/systemone
+          description: HTTP(S) endpoint without URL credentials, query or fragment.
+        model:
+          type: string
+          minLength: 1
+          maxLength: 256
+          default: jev-latest
+        prompt:
+          type: string
+          maxLength: 131072
+          description: Risk-review instructions containing both {{user_request}} and {{tool_call}}. UTF-8 bytes, including rendering, are limited to 128 KiB; values are substituted literally, not recursively. No request or tool-argument text is persisted in review metadata.
+        mode:
+          $ref: "#/components/schemas/ToolReviewMode"
+          default: mark
+        timeout_ms:
+          type: integer
+          minimum: 1
+          maximum: 120000
+          default: 5000
+        revision:
+          type: string
+          readOnly: true
+        credential_configured:
+          type: boolean
+          readOnly: true
+    ToolReviewSettingsPatch:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        enabled:
+          type: boolean
+        endpoint:
+          $ref: "#/components/schemas/ToolReviewSettings/properties/endpoint"
+        model:
+          $ref: "#/components/schemas/ToolReviewSettings/properties/model"
+        prompt:
+          $ref: "#/components/schemas/ToolReviewSettings/properties/prompt"
+        mode:
+          $ref: "#/components/schemas/ToolReviewMode"
+        timeout_ms:
+          $ref: "#/components/schemas/ToolReviewSettings/properties/timeout_ms"
+        api_key:
+          type: string
+          maxLength: 16384
+          writeOnly: true
+          description: Omit to preserve; empty clears. Stored only as a sealed secret, never echoed. Enabled settings cannot have an empty key.
+        data_transfer_acknowledged:
+          type: boolean
+          default: false
+          writeOnly: true
+          description: Confirm external transfer of the complete user request and tool arguments. Not persisted.
+    ToolReviewCall:
+      type: object
+      additionalProperties: false
+      required: [index, name, verdict, action, latency_ms, model]
+      properties:
+        index:
+          type: integer
+          minimum: 0
+        name:
+          type: string
+          maxLength: 256
+        verdict:
+          type: string
+          enum: [pass, flag, error]
+        pass_probability:
+          type: number
+          minimum: 0
+          maximum: 1
+        flag_probability:
+          type: number
+          minimum: 0
+          maximum: 1
+        action:
+          type: string
+          enum: [delivered, withheld, pending]
+        latency_ms:
+          type: integer
+          minimum: 0
+        model:
+          type: string
+          maxLength: 256
+        error_code:
+          type: string
+          pattern: "^[a-z][a-z0-9_]{0,63}$"
+          description: Bounded local code only, never raw upstream errors.
+    ToolReviewSummary:
+      type: object
+      additionalProperties: false
+      required:
+        [status, mode, model, config_revision, started_at, latency_ms, calls]
+      description: Review metadata only. Never stores user requests, tool arguments, review prompts, keys or raw upstream errors. Pending reviews become interrupted after restart even when delivery already succeeded.
+      properties:
+        status:
+          $ref: "#/components/schemas/ToolReviewStatus"
+        mode:
+          $ref: "#/components/schemas/ToolReviewMode"
+        model:
+          type: string
+          minLength: 1
+          maxLength: 256
+        config_revision:
+          type: string
+          maxLength: 128
+        started_at:
+          type: string
+          format: date-time
+        completed_at:
+          type: string
+          format: date-time
+        latency_ms:
+          type: integer
+          minimum: 0
+        calls:
+          type: array
+          maxItems: 64
+          items:
+            $ref: "#/components/schemas/ToolReviewCall"
+        error_code:
+          $ref: "#/components/schemas/ToolReviewCall/properties/error_code"
     RequestRecord:
       type: object
       required:
@@ -5976,6 +6245,8 @@ components:
         - input_preview
         - events
       properties:
+        tool_review:
+          $ref: "#/components/schemas/ToolReviewSummary"
         client_type:
           $ref: "#/components/schemas/ClientType"
         recovery:

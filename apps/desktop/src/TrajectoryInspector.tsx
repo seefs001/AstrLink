@@ -1,4 +1,5 @@
 import { RecoveryDetails } from "./components/RecoveryDetails";
+import { ToolReviewDetails } from "./ToolReviewDetails";
 import { ConversionDiagnosticsDetails } from "./components/ConversionDiagnosticsDetails";
 import { RoutingSteps } from "./components/RoutingSteps";
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -244,6 +245,9 @@ export function TrajectoryInspector({
           "overflow-y-auto overscroll-contain",
         )}
       >
+        {record.tool_review ? (
+          <ToolReviewDetails summary={record.tool_review} />
+        ) : null}
         {focusRow ? (
           <InspectorFindShortcut.Provider value={findShortcut}>
             <InspectorSection

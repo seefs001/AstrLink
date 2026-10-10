@@ -24,6 +24,10 @@ type responsesWSTurn struct {
 	eventID  string
 	streamID string
 	controls chan []byte
+	// Guarded by session.mu; cancellation also reaches post-generation review.
+	cancelReview context.CancelFunc
+	cancelled    bool
+	ctx          context.Context
 	// routingModel is this turn's model after redirects; forward pins it on
 	// the socket together with the client model.
 	routingModel string
@@ -37,8 +41,13 @@ func isResponsesWebSocket(request *http.Request) bool {
 	return request.Method == http.MethodGet && request.URL.Path == "/v1/responses" && websocket.IsWebSocketUpgrade(request)
 }
 
+type responsesWSClient interface {
+	SetWriteDeadline(time.Time) error
+	WriteMessage(int, []byte) error
+}
+
 type responsesWSSession struct {
-	client   *websocket.Conn
+	client   responsesWSClient
 	upstream transport.ResponsesSocket
 	// mu serializes admission and client writes, including terminal publication.
 	mu            sync.Mutex
@@ -83,6 +92,10 @@ func (handler *Handler) serveResponsesWebSocket(writer http.ResponseWriter, requ
 		}
 		session.mu.Lock()
 		if envelope.Type == "response.cancel" && session.active != nil {
+			session.active.cancelled = true
+			if session.active.cancelReview != nil {
+				session.active.cancelReview()
+			}
 			// Only forward the cancellation envelope, never arbitrary body fields.
 			select {
 			case session.active.controls <- responsesWSCancel(envelope.StreamID, envelope.ResponseID):
@@ -101,7 +114,7 @@ func (handler *Handler) serveResponsesWebSocket(writer http.ResponseWriter, requ
 			session.sendError(envelope.EventID, http.StatusConflict, "response_in_progress", "another response.create is already in progress")
 			continue
 		}
-		turn := &responsesWSTurn{session: session, eventID: envelope.EventID, streamID: envelope.StreamID, controls: make(chan []byte, 1)}
+		turn := &responsesWSTurn{session: session, eventID: envelope.EventID, streamID: envelope.StreamID, controls: make(chan []byte, 1), ctx: ctx}
 		session.active = turn
 		session.mu.Unlock()
 		workers.Add(1)
@@ -264,6 +277,10 @@ type responsesWSWriter struct {
 	status   int
 	buffer   []byte
 	terminal []byte
+	// A reviewed success terminal is published before success is recorded.
+	// Retain admission until finish so an immediate next turn cannot race
+	// persistence and overwrite the connection binding.
+	recordingLocked bool
 }
 
 func (writer *responsesWSWriter) Header() http.Header { return writer.header }
@@ -277,6 +294,9 @@ func (writer *responsesWSWriter) Write(data []byte) (int, error) {
 	if writer.status == 0 {
 		writer.status = 200
 	}
+	previous := len(writer.buffer)
+	consumed := 0
+	accepted := func() int { return max(0, min(len(data), consumed-previous)) }
 	writer.buffer = append(writer.buffer, data...)
 	if len(writer.buffer) > 128<<20 {
 		return 0, fmt.Errorf("Responses WebSocket event exceeds size limit")
@@ -300,33 +320,83 @@ func (writer *responsesWSWriter) Write(data []byte) (int, error) {
 		}
 		payload = bytes.TrimSpace(payload)
 		if len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) {
+			consumed += end + 2
 			continue
 		}
 		var event struct {
 			Type string `json:"type"`
 		}
 		if json.Unmarshal(payload, &event) != nil {
-			return 0, fmt.Errorf("invalid Responses event")
+			return accepted(), fmt.Errorf("invalid Responses event")
+		}
+		session := writer.turn.session
+		session.mu.Lock()
+		// Only the review gate's cancellation stops local replay. Ordinary
+		// upstream cancellation still publishes its response.cancelled terminal.
+		cancelled := writer.turn.cancelReview != nil && writer.turn.cancelled
+		cancelled = cancelled || (writer.turn.ctx != nil && writer.turn.ctx.Err() != nil)
+		if cancelled {
+			session.mu.Unlock()
+			return accepted(), context.Canceled
 		}
 		if transport.ResponsesTerminalEvent(event.Type) {
 			writer.terminal = bytes.Clone(payload)
+			session.mu.Unlock()
+			consumed += end + 2
 			continue
 		}
-		writer.turn.session.mu.Lock()
-		err := writer.turn.session.writeLocked(payload)
-		writer.turn.session.mu.Unlock()
+		err := session.writeLocked(payload)
+		session.mu.Unlock()
 		if err != nil {
-			return 0, err
+			return accepted(), err
 		}
+		consumed += end + 2
 	}
 	return len(data), nil
 }
+
+// ConfirmToolReviewDelivery is called after a reject batch passes, or before
+// detaching a mark review. It never waits for the mark reviewer. The
+// outer WebSocket handler always calls finish, which releases this lock after
+// the request record and successful routing side effects have been finalized.
+func (writer *responsesWSWriter) ConfirmToolReviewDelivery() error {
+	if writer.recordingLocked {
+		return nil
+	}
+	session := writer.turn.session
+	session.mu.Lock()
+	if writer.turn.cancelled || (writer.turn.ctx != nil && writer.turn.ctx.Err() != nil) {
+		session.mu.Unlock()
+		return context.Canceled
+	}
+	terminal := writer.terminal
+	writer.terminal = nil
+	if len(terminal) == 0 {
+		session.mu.Unlock()
+		return fmt.Errorf("reviewed Responses terminal missing")
+	}
+	if err := session.writeLocked(terminal); err != nil {
+		session.mu.Unlock()
+		return err
+	}
+	writer.recordingLocked = true
+	return nil
+}
+
 func (writer *responsesWSWriter) finish() {
 	session := writer.turn.session
+	if writer.recordingLocked {
+		session.active = nil
+		writer.recordingLocked = false
+		session.mu.Unlock()
+		return
+	}
 	session.mu.Lock()
 	defer session.mu.Unlock()
 	defer func() { session.active = nil }()
-	if writer.terminal != nil {
+	cancelled := writer.turn.cancelReview != nil && writer.turn.cancelled
+	cancelled = cancelled || (writer.turn.ctx != nil && writer.turn.ctx.Err() != nil)
+	if writer.terminal != nil && !cancelled {
 		_ = session.writeLocked(writer.terminal)
 		return
 	}

@@ -555,6 +555,28 @@ describe("conversationTurns", () => {
     expect(cancelledLabel({ ...turn.stats, cancelled: 0 })).toBeNull();
   });
 
+  it("keeps a successful but flagged review visible without changing the request outcome", () => {
+    const reviewed = record({
+      tool_review: {
+        status: "flagged",
+        mode: "mark",
+        model: "jev-latest",
+        config_revision: "r1",
+        started_at: "2026-10-03T01:00:00Z",
+        latency_ms: 5,
+        calls: [],
+      },
+    });
+    const call = conversationTurns(
+      [reviewed],
+      {},
+      new Map(),
+      Date.parse("2026-10-03T01:01:00Z"),
+    )[0].calls[0];
+    expect(call.anomaly).toBe(true);
+    expect(call.tone).toBe("ok");
+  });
+
   it("never folds a pending call and keeps the last call on its own row", () => {
     const pending = record({
       id: "req_p",

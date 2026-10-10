@@ -32,6 +32,7 @@ import (
 	"github.com/QuantumNous/astrlink/core/internal/privacy"
 	"github.com/QuantumNous/astrlink/core/internal/relaykitbridge"
 	"github.com/QuantumNous/astrlink/core/internal/secretstore"
+	"github.com/QuantumNous/astrlink/core/internal/toolreview"
 	"github.com/QuantumNous/astrlink/core/internal/transport"
 )
 
@@ -62,6 +63,8 @@ type Dependencies struct {
 	PolicyWarningReporter    PolicyWarningReporter
 	RequestRecords           RequestRecordStore
 	AuditSettings            AuditSettingsProvider
+	ToolReviewSettings       ToolReviewSettingsProvider
+	ToolReviewer             toolreview.Reviewer
 	AuditBlobs               AuditBlobPersister
 	RecordLogger             func(string, ...any)
 	AllowedHost              string
@@ -125,6 +128,9 @@ type Handler struct {
 	policyWarningReporter    PolicyWarningReporter
 	requestRecords           RequestRecordStore
 	auditSettings            AuditSettingsProvider
+	toolReviewSettings       ToolReviewSettingsProvider
+	toolReviewer             toolreview.Reviewer
+	toolReviewSlots          chan struct{}
 	auditBlobs               AuditBlobPersister
 	recordLogger             func(string, ...any)
 	allowedHosts             []string
@@ -256,6 +262,9 @@ func NewWithDependencies(dependencies Dependencies) *Handler {
 	if dependencies.Forwarder == nil {
 		dependencies.Forwarder = transport.New(nil)
 	}
+	if dependencies.ToolReviewer == nil && dependencies.ToolReviewSettings != nil {
+		dependencies.ToolReviewer = toolreview.NewClient(nil)
+	}
 	return &Handler{
 		proxyCredentials: dependencies.ProxyCredentials,
 		resolver:         dependencies.Resolver, authorizer: dependencies.Authorizer, forwarder: dependencies.Forwarder,
@@ -263,6 +272,9 @@ func NewWithDependencies(dependencies Dependencies) *Handler {
 		policyWarningReporter: dependencies.PolicyWarningReporter,
 		requestRecords:        dependencies.RequestRecords,
 		auditSettings:         dependencies.AuditSettings,
+		toolReviewSettings:    dependencies.ToolReviewSettings,
+		toolReviewer:          dependencies.ToolReviewer,
+		toolReviewSlots:       make(chan struct{}, 16),
 		auditBlobs:            dependencies.AuditBlobs,
 		recordLogger:          dependencies.RecordLogger,
 		allowedHosts:          allowedHostAliases(dependencies.AllowedHost),
@@ -332,24 +344,49 @@ func (handler *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Requ
 	}
 	session.persistPending(request.Context(), handler.requestRecords, handler.recordLogger)
 	outWriter := session.wrap(writer)
+	var review *toolReviewWriter
 	request = request.WithContext(withRecordSession(request.Context(), session))
 	defer func() {
+		if review != nil {
+			handler.finishToolReview(review, session)
+			defer review.cancel(nil)
+			if session.afterToolReview != nil && session.status == contract.RequestStatusPending &&
+				(session.toolReview.Mode == contract.ToolReviewModeMark || session.toolReview.Status == "passed" || session.toolReview.Status == "not_applicable") {
+				session.afterToolReview()
+			}
+			session.afterToolReview = nil
+		}
 		if mode := builtinInternalFrom(request.Context()); mode != nil && !mode.Native && session.endpointID != nil {
 			mode.Target = *session.endpointID
 		}
-		if request.Context().Err() != nil {
+		if request.Context().Err() != nil && !errors.Is(context.Cause(request.Context()), errToolReviewCollectionTimeout) {
 			session.noteCancelled()
 		}
-		if mode := builtinInternalFrom(request.Context()); mode == nil || !mode.Native {
-			// A tool executor's own model call does not serve the turn.
+		if mode := builtinInternalFrom(request.Context()); mode == nil {
 			handler.noteCodexTurn(classified, session)
+		} else if !mode.Native {
+			// A mapped main-model call cannot publish success on behalf of its
+			// caller. A tool executor's own model call never serves the turn.
+			mode.CodexTurn = servedCodexTurn(classified, session)
 		}
 		if mode := builtinInternalFrom(request.Context()); mode != nil && mode.SharedSession != nil {
 			return
 		}
 		// Never delay or fail the client response on persistence errors.
 		session.finish(context.Background(), handler.requestRecords, handler.auditBlobs, handler.recordLogger)
+		if review != nil && review.async != nil {
+			go review.async()
+		}
 	}()
+	review, request, err = handler.prepareToolReview(outWriter, request, classified)
+	if err != nil {
+		writeInferenceError(outWriter, http.StatusServiceUnavailable, "tool_review_unavailable", "tool call review configuration is unavailable", false, nil)
+		session.noteFailed(errorSummaryFromInference("tool_review_unavailable", "tool call review configuration is unavailable", false))
+		return
+	}
+	if review != nil {
+		outWriter = review
+	}
 
 	// One read serves model redirects, channel binding and discovery.
 	routingSettings, routingSettingsLoaded, err := handler.loadRoutingSettings(request.Context())

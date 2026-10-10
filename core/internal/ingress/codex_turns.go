@@ -161,18 +161,32 @@ func (store *codexTurnStore) evict(now time.Time) {
 // noteCodexTurn records the provider that served a Codex Responses request.
 func (handler *Handler) noteCodexTurn(classified Request, session *recordSession) {
 	if session == nil || classified.Protocol != contract.ProtocolOpenAIResponses || classified.codexTurn.empty() ||
-		session.status != contract.RequestStatusSucceeded || session.endpointID == nil {
+		session.status != contract.RequestStatusSucceeded {
+		return
+	}
+	binding := session.mappedCodexTurn
+	if binding == nil {
+		binding = servedCodexTurn(classified, session)
+	}
+	if binding == nil {
 		return
 	}
 	principal := ""
 	if session.accessTokenID != nil {
 		principal = string(*session.accessTokenID)
 	}
+	published := *binding
+	published.at = time.Now()
+	handler.codexTurns.note(principal, classified.codexTurn, published)
+}
+
+func servedCodexTurn(classified Request, session *recordSession) *codexTurnBinding {
+	if session == nil || session.status != contract.RequestStatusSucceeded || session.endpointID == nil {
+		return nil
+	}
 	model := classified.routingModel()
 	if session.recovery != nil && session.recovery.UpstreamModel != "" {
 		model = session.recovery.UpstreamModel
 	}
-	handler.codexTurns.note(principal, classified.codexTurn, codexTurnBinding{
-		service: *session.endpointID, model: model, official: session.codexOfficial, at: time.Now(),
-	})
+	return &codexTurnBinding{service: *session.endpointID, model: model, official: session.codexOfficial}
 }

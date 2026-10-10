@@ -43,6 +43,7 @@ var secretColumns = []secretColumn{
 	{table: builtinToolCredentialsTable, key: "kind", value: "credential_value", flagged: true},
 	{table: serviceProxyCredentialsTable, key: "service_id", value: "credential_value", flagged: true},
 	{table: subscriptionCredentialsTable, key: "service_id", value: "credential_value"},
+	{table: toolReviewCredentialsTable, key: "id", value: "credential_value"},
 }
 
 // openSecret returns the plaintext of one stored value. It takes ownership of
