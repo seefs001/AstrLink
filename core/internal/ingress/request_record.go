@@ -17,6 +17,7 @@ import (
 
 	"github.com/QuantumNous/astrlink/convo"
 	"github.com/QuantumNous/astrlink/core/contract"
+	"github.com/QuantumNous/astrlink/core/internal/builtintools"
 	"github.com/QuantumNous/astrlink/core/internal/endpoint"
 	"github.com/QuantumNous/astrlink/core/internal/privacy"
 	"github.com/QuantumNous/astrlink/core/internal/relaykitbridge"
@@ -222,8 +223,12 @@ type recordSession struct {
 	privacyDecision contract.PrivacyDecision
 	privacyFindings []contract.PrivacyFinding
 	toolReview      *contract.ToolReviewSummary
-	toolReviewEOF   bool
-	afterToolReview func()
+	// toolReviewActive defers success side effects even before any call or
+	// review metadata exists. Never use persisted metadata as a gate flag.
+	toolReviewActive   bool
+	toolReviewEOF      bool
+	afterToolReview    func()
+	builtinPublication *builtintools.Publication
 	// requestExposure is the label of the stored client body; empty until
 	// it is stored.
 	requestExposure storage.AuditExposure
@@ -2003,11 +2008,7 @@ func (writer *recordStatusWriter) Flush() {
 }
 
 func (writer *recordStatusWriter) FlushError() error {
-	if controller, ok := writer.ResponseWriter.(interface{ FlushError() error }); ok {
-		return controller.FlushError()
-	}
-	writer.Flush()
-	return nil
+	return http.NewResponseController(writer.ResponseWriter).Flush()
 }
 
 func (writer *recordStatusWriter) Unwrap() http.ResponseWriter {

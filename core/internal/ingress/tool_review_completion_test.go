@@ -76,7 +76,7 @@ func TestToolReviewNoToolsDisconnectAfterTerminalStaysSuccessful(t *testing.T) {
 	response := reviewCancelAfterWrite{httptest.NewRecorder(), cancel}
 	handler.ServeHTTP(response, httptest.NewRequest("POST", "/v1/responses", strings.NewReader(`{"model":"m","input":"inspect","stream":true}`)).WithContext(ctx))
 	record := records.latest(t)
-	if record.Status != contract.RequestStatusSucceeded || record.ToolReview.Status != "not_applicable" {
+	if record.Status != contract.RequestStatusSucceeded || record.ToolReview != nil {
 		t.Fatalf("delivered terminal downgraded: status=%s review=%+v", record.Status, record.ToolReview)
 	}
 }
@@ -138,6 +138,28 @@ func TestToolReviewDeliveryFailureDoesNotClaimDelivered(t *testing.T) {
 			// Even an upstream response ID observed before the failed write must not pin a later turn.
 			if _, err := handler.bindResponseAffinity(context.Background(), Request{Protocol: contract.ProtocolOpenAIResponses, Model: "m", PreviousResponseID: "resp_review"}, handler.resolver.(candidateResolver).candidates); err == nil {
 				t.Fatal("failed delivery created affinity")
+			}
+		})
+	}
+}
+
+func TestToolReviewNoToolsDeliveryFailureRemainsVisible(t *testing.T) {
+	for _, mode := range []contract.ToolReviewMode{contract.ToolReviewModeMark, contract.ToolReviewModeReject} {
+		t.Run(string(mode), func(t *testing.T) {
+			handler, records := reviewTestHandler(t, mode, func(http.ResponseWriter, *http.Request) {
+				t.Error("no-tool response reached judge")
+			}, func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"id":"resp_text","status":"completed","output":[]}`)
+			}, false)
+			response := &reviewBrokenWriter{header: make(http.Header), zero: true}
+			handler.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"m","input":"inspect"}`)))
+			record := records.latest(t)
+			if record.Status != contract.RequestStatusFailed || record.ToolReview == nil || record.ToolReview.Status != "failed" || record.ToolReview.RejectThreshold == nil {
+				t.Fatalf("delivery failure was hidden without calls: %+v", record)
+			}
+			if mode == contract.ToolReviewModeReject && record.ToolReview.ErrorCode != "client_delivery_failed" {
+				t.Fatalf("gate failure lost its error: %+v", record.ToolReview)
 			}
 		})
 	}

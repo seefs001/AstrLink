@@ -1,6 +1,7 @@
-import { ToolReviewBadge } from "./ToolReviewDetails";
 import {
   isValidElement,
+  createContext,
+  useContext,
   memo,
   useCallback,
   useEffect,
@@ -65,7 +66,19 @@ import {
 } from "./request-trajectory-model";
 import { TrajectoryInspector } from "./TrajectoryInspector";
 import { useDetachedInspector } from "./trajectory-inspector-window";
-import { useConversationContent } from "./use-conversation-content";
+import {
+  useConversationContent,
+  conversationContentVersion,
+} from "./use-conversation-content";
+import {
+  canLocateReviewedTool,
+  type ToolReviewJump,
+} from "./tool-review-navigation";
+
+const ToolJumpContext = createContext<{
+  jump: ToolReviewJump | null;
+  reveal: (element: HTMLElement) => void;
+}>({ jump: null, reveal: () => {} });
 
 const NO_SERVICES: RequestServiceMap = {};
 /** How far from the end the reader may drift and still count as following. */
@@ -82,6 +95,7 @@ const TOOL_KINDS_SHOWN = 3;
  * differs.
  */
 export function RequestConversation({
+  toolJump = null,
   session,
   turns,
   childrenByRoot,
@@ -96,6 +110,7 @@ export function RequestConversation({
   onUnlockRaw,
   outlineOpen,
 }: {
+  toolJump?: ToolReviewJump | null;
   session: RequestSession;
   turns: RequestRecord[];
   childrenByRoot: Record<string, RequestRecord[]>;
@@ -172,10 +187,18 @@ export function RequestConversation({
   const scrollerRef = useRef<HTMLDivElement>(null);
   const turnRefs = useRef(new Map<string, HTMLElement>());
   const atBottomRef = useRef(true);
+  const followSuppressedRef = useRef(false);
+  const consumedJumpRef = useRef<string | null>(null);
+  const focusedJumpRef = useRef<string | null>(null);
+  const [locatingJump, setLocatingJump] = useState<ToolReviewJump | null>(null);
   const turnCountRef = useRef(model.length);
   const seenObserverRef = useRef<IntersectionObserver | null>(null);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
+    followSuppressedRef.current = false;
+    consumedJumpRef.current = null;
+    focusedJumpRef.current = null;
+    setLocatingJump(null);
     setTurnOverrides(new Map());
     setShowAllTurns(new Set());
     setOpenRuns(new Set());
@@ -246,8 +269,9 @@ export function RequestConversation({
     const scroller = scrollerRef.current;
     if (!scroller) return;
     const bottom =
+      !followSuppressedRef.current &&
       scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight <=
-      FOLLOW_SLACK_PX;
+        FOLLOW_SLACK_PX;
     atBottomRef.current = bottom;
     setAtBottom(bottom);
     if (bottom) setNewTurns(0);
@@ -267,15 +291,136 @@ export function RequestConversation({
     const scroller = scrollerRef.current;
     if (!scroller) return;
     scroller.scrollTop = scroller.scrollHeight;
+    followSuppressedRef.current = false;
     atBottomRef.current = true;
     setAtBottom(true);
     setNewTurns(0);
   }, []);
 
+  const currentJump =
+    locatingJump &&
+    toolJump?.nonce === locatingJump.nonce &&
+    locatingJump.sessionId === session.id &&
+    locatingJump.requestId === selectedRequestId
+      ? locatingJump
+      : null;
+  const jumpCall = currentJump
+    ? model
+        .flatMap((turn) => turn.calls)
+        .find((call) => call.record.id === currentJump.requestId)
+    : undefined;
+  const jumpParsed = jumpCall?.parsed;
+  const jumpRead =
+    jumpCall &&
+    jumpParsed?.contentVersion === conversationContentVersion(jumpCall.record);
+  const jumpFailure = currentJump
+    ? !jumpCall ||
+      !canLocateReviewedTool(jumpCall.record, currentJump.reviewIndex)
+      ? "unreliable"
+      : content.errors.has(currentJump.requestId)
+        ? "unreliable"
+        : jumpRead
+          ? (jumpParsed?.toolLocationFailure ??
+            (jumpCall.toolCalls.some(
+              (tool) => tool.reviewIndex === currentJump.reviewIndex,
+            )
+              ? null
+              : "unreliable"))
+          : null
+    : null;
+  const readyJump =
+    currentJump && jumpRead && !jumpFailure ? currentJump : null;
+
+  useLayoutEffect(() => {
+    if (!toolJump || consumedJumpRef.current === toolJump.nonce) return;
+    if (
+      toolJump.sessionId !== session.id ||
+      toolJump.requestId !== selectedRequestId
+    )
+      return;
+    consumedJumpRef.current = toolJump.nonce;
+    setLocatingJump(toolJump);
+    setInspectorOpen(false);
+    setRevealedId(session.id);
+    followSuppressedRef.current = true;
+    atBottomRef.current = false;
+    setAtBottom(false);
+    const turn = model.find((turn) =>
+      turn.calls.some((call) => call.record.id === toolJump.requestId),
+    );
+    if (!turn) return;
+    setCurrentTurnId(turn.id);
+    setTurnOverrides((current) => new Map(current).set(turn.id, true));
+    const run = turn.segments.find(
+      (segment) =>
+        segment.kind === "run" &&
+        segment.calls.some((call) => call.record.id === toolJump.requestId),
+    );
+    if (run?.kind === "run")
+      setOpenRuns((current) => new Set(current).add(run.calls[0]!.record.id));
+    content.request(turn.calls.map((call) => call.record));
+  }, [toolJump, session.id, selectedRequestId, model, content.request]);
+
+  // Parsing can regroup routine calls into a different run. Re-open that
+  // final path before focusing, but do not fight manual folding afterwards.
+  useLayoutEffect(() => {
+    if (!readyJump || focusedJumpRef.current === readyJump.nonce) return;
+    const turn = model.find((item) =>
+      item.calls.some((call) => call.record.id === readyJump.requestId),
+    );
+    if (!turn) return;
+    setTurnOverrides((current) =>
+      current.get(turn.id) === true
+        ? current
+        : new Map(current).set(turn.id, true),
+    );
+    const run = turn.segments.find(
+      (segment) =>
+        segment.kind === "run" &&
+        segment.calls.some((call) => call.record.id === readyJump.requestId),
+    );
+    if (run?.kind === "run") {
+      const id = run.calls[0]!.record.id;
+      setOpenRuns((current) =>
+        current.has(id) ? current : new Set(current).add(id),
+      );
+    }
+  }, [readyJump, model]);
+
+  useLayoutEffect(() => {
+    // A failed jump reveals one explanation at the start of this panel, not
+    // another fixed banner above it or a scroll of the surrounding page.
+    if (jumpFailure && scrollerRef.current) {
+      scrollerRef.current.scrollTop = 0;
+    }
+  }, [currentJump?.nonce, jumpFailure]);
+
+  const revealTool = useCallback(
+    (element: HTMLElement) => {
+      const scroller = scrollerRef.current;
+      if (!scroller || !readyJump || focusedJumpRef.current === readyJump.nonce)
+        return;
+      focusedJumpRef.current = readyJump.nonce;
+      // Keep the sticky call/run headings clear. Never scroll ancestors or the page.
+      scroller.scrollTop +=
+        element.getBoundingClientRect().top -
+        scroller.getBoundingClientRect().top -
+        64;
+      element.focus({ preventScroll: true });
+      followSuppressedRef.current = true;
+      atBottomRef.current = false;
+    },
+    [readyJump],
+  );
+  const toolJumpContext = useMemo(
+    () => ({ jump: readyJump, reveal: revealTool }),
+    [readyJump, revealTool],
+  );
+
   // A new session opens at its end. Only the session may do this: the model
   // is rebuilt every second while a call runs, and that must never scroll.
   useLayoutEffect(() => {
-    scrollToEnd();
+    if (!followSuppressedRef.current) scrollToEnd();
   }, [session.id, scrollToEnd]);
 
   // Content grows as calls land and bodies load. Keep the end in view for a
@@ -395,7 +540,7 @@ export function RequestConversation({
       className="@container/conversation flex min-h-0 min-w-0 flex-1"
       data-testid="request-conversation"
     >
-      <div className="relative flex min-h-0 min-w-0 flex-1">
+      <div className="relative flex min-h-0 min-w-0 flex-1 flex-col">
         <div
           aria-busy={!revealed}
           aria-label={t("conversation.stream")}
@@ -407,7 +552,40 @@ export function RequestConversation({
           onScroll={measure}
           ref={scrollerRef}
         >
-          {anyLocked ? (
+          {currentJump ? (
+            jumpFailure ? (
+              <FormMessage
+                role="alert"
+                data-testid="tool-review-location-status"
+                className="mb-2 flex flex-wrap items-center gap-x-3 gap-y-1 py-1.5"
+              >
+                <span className="min-w-0 flex-1">
+                  {t(`toolReview.location.${jumpFailure}`)}
+                </span>
+                {jumpFailure === "locked" && onUnlockRaw ? (
+                  <Button
+                    onClick={onUnlockRaw}
+                    size="xs"
+                    type="button"
+                    variant="outline"
+                  >
+                    {t("rawSealing.unlockTitle")}
+                  </Button>
+                ) : null}
+              </FormMessage>
+            ) : (
+              // Focus and highlight are the visible success feedback. Keep
+              // its announcement without consuming a permanent banner row.
+              <span
+                role="status"
+                aria-live="polite"
+                data-testid="tool-review-location-status"
+                className="sr-only"
+              >
+                {t(`toolReview.location.${readyJump ? "located" : "loading"}`)}
+              </span>
+            )
+          ) : anyLocked ? (
             <FormMessage
               className="mt-3 flex items-center gap-3 py-1.5"
               data-testid="conversation-locked"
@@ -432,31 +610,33 @@ export function RequestConversation({
               {t("conversation.uncapturedNotice")}
             </FormMessage>
           ) : null}
-          <ol>
-            {model.map((turn) => (
-              <TurnView
-                call={selectedCall}
-                copyFeedback={copyFeedback}
-                inspectorOpen={showInspector}
-                key={turn.id}
-                onSelectCall={selectCall}
-                onToggle={toggleTurn}
-                onToggleRun={toggleRun}
-                onToggleShowAll={toggleShowAll}
-                open={turnOpen(turn)}
-                openRuns={openRuns}
-                reading={content.reading}
-                refFor={(element) => {
-                  if (element) turnRefs.current.set(turn.id, element);
-                  else turnRefs.current.delete(turn.id);
-                }}
-                services={services}
-                session={session}
-                showAll={showAllTurns.has(turn.id)}
-                turn={turn}
-              />
-            ))}
-          </ol>
+          <ToolJumpContext.Provider value={toolJumpContext}>
+            <ol>
+              {model.map((turn) => (
+                <TurnView
+                  call={selectedCall}
+                  copyFeedback={copyFeedback}
+                  inspectorOpen={showInspector}
+                  key={turn.id}
+                  onSelectCall={selectCall}
+                  onToggle={toggleTurn}
+                  onToggleRun={toggleRun}
+                  onToggleShowAll={toggleShowAll}
+                  open={turnOpen(turn)}
+                  openRuns={openRuns}
+                  reading={content.reading}
+                  refFor={(element) => {
+                    if (element) turnRefs.current.set(turn.id, element);
+                    else turnRefs.current.delete(turn.id);
+                  }}
+                  services={services}
+                  session={session}
+                  showAll={showAllTurns.has(turn.id)}
+                  turn={turn}
+                />
+              ))}
+            </ol>
+          </ToolJumpContext.Provider>
         </div>
         {!atBottom && (newTurns > 0 || sessionPending) ? (
           <Button
@@ -702,7 +882,7 @@ const TurnView = memo(function TurnView({
             type="button"
             variant="ghost"
           >
-            <span className="flex min-w-0 items-center gap-1.5">
+            <span className="flex min-w-0 flex-wrap items-center gap-1.5">
               <ChevronRight
                 aria-hidden="true"
                 className={cn(
@@ -717,7 +897,12 @@ const TurnView = memo(function TurnView({
                   </span>,
                   // A turn that called no tools leaves the count out.
                   !turn.stats.toolCalls ? null : toolsNamed ? (
-                    <span key="tools" title={toolCountLabel(turn.stats.tools)}>
+                    <span
+                      className="min-w-0 text-left whitespace-normal [overflow-wrap:anywhere]"
+                      data-testid="conversation-tools-summary"
+                      key="tools"
+                      title={toolCountLabel(turn.stats.tools)}
+                    >
                       {toolsLabel(turn.stats.tools)}
                     </span>
                   ) : (
@@ -1113,6 +1298,11 @@ const CallRow = memo(function CallRow({
     call.toolCalls.length > 0 ||
     (call.gapMs !== null && call.gapMs >= 500);
   const [open, setOpen] = useState(true);
+  const { jump } = useContext(ToolJumpContext);
+  const revealNonce = jump?.requestId === call.record.id ? jump.nonce : null;
+  useLayoutEffect(() => {
+    if (revealNonce) setOpen(true);
+  }, [revealNonce]);
   const replyCopyKey = `conversation-reply:${call.record.id}`;
   return (
     <li data-testid="conversation-call" data-tone={call.tone}>
@@ -1138,9 +1328,6 @@ const CallRow = memo(function CallRow({
           variant="ghost"
         >
           <StatusDot className="size-2" tone={dotTone(call.tone)} />
-          {call.record.tool_review ? (
-            <ToolReviewBadge summary={call.record.tool_review} />
-          ) : null}
           <span className="flex min-w-0 items-baseline gap-2 whitespace-nowrap">
             <span className="font-medium">
               {t("conversation.callNumber", { index: call.index })}
@@ -1210,7 +1397,11 @@ const CallRow = memo(function CallRow({
             />
           ) : null}
           {call.toolCalls.map((tool, index) => (
-            <ToolRow key={`${tool.id ?? index}`} tool={tool} />
+            <ToolRow
+              key={`${tool.id ?? index}`}
+              tool={tool}
+              requestId={call.record.id}
+            />
           ))}
           {call.gapMs !== null && call.gapMs >= 500 ? (
             <p className="mb-1.5 ml-[18px] text-micro text-muted-foreground">
@@ -1276,9 +1467,26 @@ function prettyJson(text: string): string {
   }
 }
 
-function ToolRow({ tool }: { tool: ConversationToolCall }) {
+function ToolRow({
+  tool,
+  requestId,
+}: {
+  tool: ConversationToolCall;
+  requestId: string;
+}) {
   const t = useT();
   const [open, setOpen] = useState(tool.isError);
+  const buttonRef = useRef<HTMLButtonElement>(null);
+  const { jump, reveal } = useContext(ToolJumpContext);
+  const targeted =
+    jump?.requestId === requestId && jump.reviewIndex === tool.reviewIndex;
+  const revealNonce = targeted ? jump.nonce : null;
+  useLayoutEffect(() => {
+    if (revealNonce) setOpen(true);
+  }, [revealNonce]);
+  useLayoutEffect(() => {
+    if (revealNonce && open && buttonRef.current) reveal(buttonRef.current);
+  }, [revealNonce, open, reveal]);
   const [fullResult, setFullResult] = useState(false);
   const status =
     tool.result === null
@@ -1290,8 +1498,19 @@ function ToolRow({ tool }: { tool: ConversationToolCall }) {
     tool.args.length >= TOOL_TEXT_LIMIT ||
     (tool.result?.length ?? 0) >= TOOL_TEXT_LIMIT;
   return (
-    <div className="ml-[18px]" data-testid="conversation-tool">
+    <div
+      className={cn(
+        "ml-[18px]",
+        targeted && "rounded-sm bg-accent ring-2 ring-primary/50",
+      )}
+      data-testid="conversation-tool"
+      data-request-id={requestId}
+      data-review-index={tool.reviewIndex}
+      data-tool-selected={targeted || undefined}
+    >
       <Button
+        ref={buttonRef}
+        aria-current={targeted ? "true" : undefined}
         aria-expanded={open}
         className="grid h-7 w-full grid-cols-[auto_minmax(0,1fr)_auto] items-baseline gap-x-2 rounded-sm px-0 text-left text-xs font-normal hover:bg-transparent hover:text-foreground"
         onClick={() => setOpen((current) => !current)}

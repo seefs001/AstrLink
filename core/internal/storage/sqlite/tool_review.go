@@ -88,6 +88,15 @@ func (store *Store) UpdateToolReviewSettings(ctx context.Context, patch contract
 		return record, storage.ErrPrecondition
 	}
 	settings := current.Settings
+	if patch.Backend != nil {
+		settings.Backend = *patch.Backend
+	}
+	backendChanged := settings.Backend != current.Settings.Backend
+	// A saved credential belongs to the currently selected backend. Never send
+	// it to a newly selected backend without explicit replacement or clearing.
+	if backendChanged && current.Settings.CredentialConfigured && patch.APIKey == nil {
+		return record, fmt.Errorf("%w: switching tool review backend requires an explicit credential replacement or clearing", storage.ErrInvalidArgument)
+	}
 	if patch.Enabled != nil {
 		settings.Enabled = *patch.Enabled
 	}
@@ -106,6 +115,18 @@ func (store *Store) UpdateToolReviewSettings(ctx context.Context, patch contract
 	if patch.TimeoutMS != nil {
 		settings.TimeoutMS = *patch.TimeoutMS
 	}
+	if patch.RejectThreshold != nil {
+		settings.RejectThreshold = *patch.RejectThreshold
+	}
+	if patch.BatchCalls != nil {
+		settings.BatchCalls = *patch.BatchCalls
+	}
+	if patch.AskOnReviewError != nil {
+		settings.AskOnReviewError = *patch.AskOnReviewError
+	}
+	if patch.ApprovalTimeoutMS != nil {
+		settings.ApprovalTimeoutMS = *patch.ApprovalTimeoutMS
+	}
 	if patch.APIKey != nil {
 		if len(*patch.APIKey) > 16384 || (*patch.APIKey != "" && (strings.TrimSpace(*patch.APIKey) != *patch.APIKey || strings.ContainsAny(*patch.APIKey, "\r\n\x00"))) {
 			return record, fmt.Errorf("%w: invalid tool review credential", storage.ErrInvalidArgument)
@@ -115,7 +136,7 @@ func (store *Store) UpdateToolReviewSettings(ctx context.Context, patch contract
 	if err := settings.Validate(); err != nil {
 		return record, fmt.Errorf("%w: %v", storage.ErrInvalidArgument, err)
 	}
-	needsAcknowledgement := settings.Enabled && (!current.Settings.Enabled || settings.Endpoint != current.Settings.Endpoint)
+	needsAcknowledgement := settings.Enabled && (!current.Settings.Enabled || settings.Endpoint != current.Settings.Endpoint || backendChanged)
 	if needsAcknowledgement && !patch.DataTransferAcknowledged {
 		return record, storage.ErrToolReviewAcknowledgement
 	}

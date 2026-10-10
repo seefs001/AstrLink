@@ -2545,6 +2545,104 @@ impl CoreManager {
         serde_json::from_slice(&body).map_err(|_| "invalid tool response".into())
     }
 
+    pub async fn list_tool_review_approvals(
+        &self,
+    ) -> Result<crate::tool_review_approval::PendingList, String> {
+        use crate::tool_review_approval::{
+            validate_id, PendingList, MAX_PENDING_APPROVALS, PATH, UNAVAILABLE,
+        };
+        let body = self
+            .tool_review_approval_request(Method::GET, PATH, None)
+            .await?;
+        let pending: PendingList = serde_json::from_slice(&body).map_err(|_| UNAVAILABLE)?;
+        if pending.items.len() > MAX_PENDING_APPROVALS {
+            return Err(UNAVAILABLE.into());
+        }
+        for item in &pending.items {
+            validate_id(&item.id).map_err(|_| UNAVAILABLE)?;
+        }
+        Ok(pending)
+    }
+
+    pub async fn get_tool_review_approval(
+        &self,
+        approval_id: &str,
+    ) -> Result<crate::tool_review_approval::Detail, String> {
+        use crate::tool_review_approval::{validate_id, Detail, PATH, UNAVAILABLE};
+        validate_id(approval_id)?;
+        let body = self
+            .tool_review_approval_request(Method::GET, &format!("{PATH}/{approval_id}"), None)
+            .await?;
+        let detail: Detail = serde_json::from_slice(&body).map_err(|_| UNAVAILABLE)?;
+        if detail.id != approval_id {
+            return Err(UNAVAILABLE.into());
+        }
+        Ok(detail)
+    }
+
+    pub async fn decide_tool_review_approval(
+        &self,
+        approval_id: &str,
+        decision: &str,
+    ) -> Result<crate::tool_review_approval::Approval, String> {
+        use crate::tool_review_approval::{
+            validate_decision, validate_id, Approval, PATH, UNAVAILABLE,
+        };
+        validate_id(approval_id)?;
+        validate_decision(decision)?;
+        let body = self
+            .tool_review_approval_request(
+                Method::POST,
+                &format!("{PATH}/{approval_id}/decision"),
+                Some(serde_json::json!({"decision": decision})),
+            )
+            .await?;
+        let approval: Approval = serde_json::from_slice(&body).map_err(|_| UNAVAILABLE)?;
+        if approval.id != approval_id {
+            return Err(UNAVAILABLE.into());
+        }
+        Ok(approval)
+    }
+
+    // Deliberately bypass the generic control helper: its transport logs include
+    // a URL/error, and its retry could replay a decision. This route uses only
+    // the operator token, never observer access or a newly issued raw grant.
+    async fn tool_review_approval_request(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<serde_json::Value>,
+    ) -> Result<Vec<u8>, String> {
+        use crate::tool_review_approval::{status_result, UNAVAILABLE};
+        let (base_url, token, generation) = {
+            let inner = self.lock_inner();
+            if inner.phase != CorePhase::Ready {
+                return Err(UNAVAILABLE.into());
+            }
+            (
+                inner.ready.as_ref().ok_or(UNAVAILABLE)?.control_url.clone(),
+                inner.control_token.clone().ok_or(UNAVAILABLE)?,
+                inner.generation,
+            )
+        };
+        let mut request = self
+            .client
+            .request(method, format!("{}{path}", base_url.trim_end_matches('/')))
+            .timeout(Duration::from_secs(5))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"));
+        if let Some(body) = body {
+            request = request.json(&body);
+        }
+        let response = request.send().await.map_err(|_| UNAVAILABLE)?;
+        status_result(response.status())?;
+        let body = response.bytes().await.map_err(|_| UNAVAILABLE)?;
+        let inner = self.lock_inner();
+        if inner.phase != CorePhase::Ready || inner.generation != generation {
+            return Err(UNAVAILABLE.into());
+        }
+        Ok(body.to_vec())
+    }
+
     pub async fn get_tool_review_settings(&self) -> Result<serde_json::Value, String> {
         self.tool_review_settings_request(Method::GET, None, None)
             .await
@@ -4915,8 +5013,10 @@ fn timestamp_query_charset_ok(value: &str) -> bool {
 }
 
 fn build_request_session_query(query: &serde_json::Value) -> Result<String, String> {
-    if query.get("tool_review_status").is_some() {
-        return Err("tool_review_status is only supported for request records".into());
+    for key in ["tool_review_status", "tool_review_only"] {
+        if query.get(key).is_some() {
+            return Err(format!("{key} is only supported for request records"));
+        }
     }
     let mut record_query = query.clone();
     let kind = record_query
@@ -4954,6 +5054,7 @@ fn build_request_record_query(query: &serde_json::Value) -> Result<String, Strin
     let mut local_access_token_ids: Vec<&str> = Vec::new();
     let mut status: Option<&str> = None;
     let mut tool_review_status: Option<&str> = None;
+    let mut tool_review_only: Option<bool> = None;
 
     for (key, value) in object {
         match key.as_str() {
@@ -5066,6 +5167,13 @@ fn build_request_record_query(query: &serde_json::Value) -> Result<String, Strin
                     .ok_or("invalid tool review status filter")?;
                 tool_review_status = Some(text);
             }
+            "tool_review_only" => {
+                tool_review_only = Some(
+                    value
+                        .as_bool()
+                        .ok_or("request record query tool_review_only must be a boolean")?,
+                );
+            }
             other => {
                 return Err(format!("request record query contains unknown key {other}"));
             }
@@ -5102,6 +5210,9 @@ fn build_request_record_query(query: &serde_json::Value) -> Result<String, Strin
     }
     if let Some(value) = tool_review_status {
         pairs.push(format!("tool_review_status={value}"));
+    }
+    if let Some(value) = tool_review_only {
+        pairs.push(format!("tool_review_only={value}"));
     }
     if pairs.is_empty() {
         return Ok(String::new());
@@ -5940,6 +6051,199 @@ mod tests {
     }
 
     #[test]
+    fn tool_review_approval_inputs_fail_before_core_access() {
+        use crate::tool_review_approval::{INVALID, UNAVAILABLE};
+        let manager = CoreManager::new();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            for id in ["", "../approval", "a/decision", "a?decision=allow", "a\n"] {
+                assert_eq!(
+                    manager.get_tool_review_approval(id).await.err().unwrap(),
+                    INVALID
+                );
+                assert_eq!(
+                    manager
+                        .decide_tool_review_approval(id, "allow")
+                        .await
+                        .err()
+                        .unwrap(),
+                    INVALID
+                );
+            }
+            assert_eq!(
+                manager
+                    .decide_tool_review_approval("safe_id", "approve")
+                    .await
+                    .err()
+                    .unwrap(),
+                INVALID
+            );
+            assert_eq!(
+                manager.list_tool_review_approvals().await.err().unwrap(),
+                UNAVAILABLE
+            );
+            assert_eq!(
+                manager
+                    .get_tool_review_approval("safe_id")
+                    .await
+                    .err()
+                    .unwrap(),
+                UNAVAILABLE
+            );
+            assert_eq!(
+                manager
+                    .decide_tool_review_approval("safe_id", "allow")
+                    .await
+                    .err()
+                    .unwrap(),
+                UNAVAILABLE
+            );
+        });
+    }
+
+    #[test]
+    fn tool_review_approval_uses_operator_http_and_constant_errors() {
+        use std::io::{BufRead, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for (status, body) in [
+                ("200 OK", r#"{"items":[]}"#),
+                (
+                    "200 OK",
+                    r#"{"id":"approval_a","request_id":"request_a","user_request":"private request","calls":[{"index":0,"name":"shell","arguments":"private arguments"}]}"#,
+                ),
+                (
+                    "200 OK",
+                    r#"{"id":"approval_a","state":"approved","review_status":"flagged","requested_at":"now","expires_at":"later","decided_at":"now"}"#,
+                ),
+                ("423 Locked", "private raw error"),
+                ("409 Conflict", "private decision error"),
+                ("410 Gone", "private expired error"),
+                ("403 Forbidden", "private observer error"),
+                ("422 Unprocessable Entity", "private invalid error"),
+                ("500 Internal Server Error", "private upstream error"),
+                ("200 OK", "private malformed response"),
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = std::io::BufReader::new(&mut stream);
+                let mut headers = String::new();
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = value.trim().parse().unwrap();
+                    }
+                    headers.push_str(&line);
+                }
+                let mut input = vec![0; length];
+                reader.read_exact(&mut input).unwrap();
+                requests.push((headers, input));
+                write!(stream, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+            requests
+        });
+        let manager = CoreManager::new();
+        {
+            let mut inner = manager.lock_inner();
+            inner.phase = CorePhase::Ready;
+            inner.control_token = Some("operator-approval-test-token".into());
+            inner.observer_token = Some("observer-approval-test-token".into());
+            inner.ready = Some(ReadyAnnouncement {
+                event: "ready".into(),
+                core_version: "0.1.0".into(),
+                control_api_version: "v1".into(),
+                protocol_contract_version: "v1".into(),
+                inference_url: format!("http://{address}"),
+                client_inference_url: format!("http://{address}"),
+                control_url: format!("http://{address}"),
+            });
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            assert!(manager
+                .list_tool_review_approvals()
+                .await
+                .unwrap()
+                .items
+                .is_empty());
+            let detail = manager
+                .get_tool_review_approval("approval_a")
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(detail).unwrap()["calls"][0]["arguments"],
+                "private arguments"
+            );
+            let approval = manager
+                .decide_tool_review_approval("approval_a", "allow")
+                .await
+                .unwrap();
+            assert_eq!(serde_json::to_value(approval).unwrap()["state"], "approved");
+            assert_eq!(
+                manager
+                    .get_tool_review_approval("approval_a")
+                    .await
+                    .err()
+                    .unwrap(),
+                "raw_locked"
+            );
+            for expected in [
+                "tool_review_approval_not_pending",
+                "tool_review_approval_not_pending",
+                "tool_review_approval_forbidden",
+                "tool_review_approval_invalid",
+                "tool_review_approval_unavailable",
+                "tool_review_approval_unavailable",
+            ] {
+                assert_eq!(
+                    manager
+                        .decide_tool_review_approval("approval_a", "deny")
+                        .await
+                        .err()
+                        .unwrap(),
+                    expected
+                );
+            }
+        });
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 10, "decisions must not be retried");
+        assert!(requests[0]
+            .0
+            .starts_with("GET /control/v1/tool-review/approvals "));
+        assert!(requests[1]
+            .0
+            .starts_with("GET /control/v1/tool-review/approvals/approval_a "));
+        assert!(requests[2]
+            .0
+            .starts_with("POST /control/v1/tool-review/approvals/approval_a/decision "));
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&requests[2].1).unwrap(),
+            serde_json::json!({"decision":"allow"})
+        );
+        for (headers, _) in &requests {
+            assert!(headers
+                .to_lowercase()
+                .contains("authorization: bearer operator-approval-test-token"));
+            assert!(!headers.contains("observer-approval-test-token"));
+            assert!(!headers.contains("raw-unlock"));
+        }
+    }
+
+    #[test]
     fn tool_review_settings_use_operator_http_and_etag_without_exposing_error_body() {
         use std::io::{BufRead, Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -5975,7 +6279,7 @@ mod tests {
                         "private upstream error key=secret".to_string(),
                     )
                 } else {
-                    ("200 OK", serde_json::json!({"enabled":index == 1,"endpoint":"https://api.typesafe.ai/v1/systemone","model":"jev-latest","prompt":"{{user_request}}\n{{tool_call}}","mode":"mark","timeout_ms":5000,"revision":"r1","credential_configured":true}).to_string())
+                    ("200 OK", serde_json::json!({"enabled":index == 1,"endpoint":"https://api.typesafe.ai/v1/systemone","model":"jev-latest","prompt":"{{user_request}}\n{{tool_call}}","mode":"mark","reject_threshold":0.5,"timeout_ms":5000,"revision":"r1","credential_configured":true}).to_string())
                 };
                 write!(stream, "HTTP/1.1 {status}\r\nETag: {response_etag}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
             }
@@ -6005,11 +6309,13 @@ mod tests {
             .unwrap();
         assert_eq!(read["etag"], etag);
         assert!(read["settings"].get("api_key").is_none());
-        let patch = serde_json::json!({"enabled":true,"api_key":"write-only-key","data_transfer_acknowledged":true});
+        assert_eq!(read["settings"]["reject_threshold"], 0.5);
+        let patch = serde_json::json!({"enabled":true,"reject_threshold":0.5,"api_key":"write-only-key","data_transfer_acknowledged":true});
         let saved = runtime
             .block_on(manager.update_tool_review_settings(&etag, patch.clone()))
             .unwrap();
         assert_eq!(saved["settings"]["enabled"], true);
+        assert_eq!(saved["settings"]["reject_threshold"], 0.5);
         let error = runtime
             .block_on(manager.update_tool_review_settings(&etag, patch.clone()))
             .unwrap_err();
@@ -6242,6 +6548,51 @@ mod tests {
             build_request_session_query(&serde_json::json!({"tool_review_status":"flagged"}))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn tool_review_only_query_is_boolean_and_request_only() {
+        for value in [true, false] {
+            assert_eq!(
+                build_request_record_query(&serde_json::json!({"tool_review_only":value})).unwrap(),
+                format!("?tool_review_only={value}")
+            );
+            assert_eq!(
+                build_request_record_query(&serde_json::json!({
+                    "tool_review_only":value, "tool_review_status":"flagged", "limit":50
+                }))
+                .unwrap(),
+                format!("?limit=50&tool_review_status=flagged&tool_review_only={value}")
+            );
+        }
+        for value in [
+            serde_json::json!(null),
+            serde_json::json!("true"),
+            serde_json::json!("false"),
+            serde_json::json!(0),
+            serde_json::json!(1),
+            serde_json::json!([]),
+            serde_json::json!({}),
+        ] {
+            assert_eq!(
+                build_request_record_query(&serde_json::json!({"tool_review_only":value}))
+                    .unwrap_err(),
+                "request record query tool_review_only must be a boolean"
+            );
+        }
+        for key in ["tool_review_only", "tool_review_status"] {
+            for value in [
+                serde_json::json!(true),
+                serde_json::json!(false),
+                serde_json::json!(null),
+                serde_json::json!("flagged"),
+            ] {
+                assert_eq!(
+                    build_request_session_query(&serde_json::json!({key:value})).unwrap_err(),
+                    format!("{key} is only supported for request records")
+                );
+            }
+        }
     }
 
     #[test]

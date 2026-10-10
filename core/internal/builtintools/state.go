@@ -60,11 +60,67 @@ func (store *Store) expire() {
 		}
 	}
 }
-func (store *Store) Put(principal, id string, state State) error {
+
+// Publication owns an immutable, unpublished response and its item indexes.
+// Staging never changes Store.Get/Prepare visibility or evicts committed state.
+// Commit and Discard are terminal, serialized decisions for one publication.
+type Publication struct {
+	mu      sync.Mutex
+	store   *Store
+	key     stateKey
+	data    []byte
+	items   []string
+	pending bool
+}
+
+func (store *Store) Stage(principal, id string, state State) (*Publication, error) {
 	data, err := json.Marshal(state)
+	if err != nil {
+		return nil, err
+	}
+	store.mu.Lock()
+	limit := store.Limit
+	store.mu.Unlock()
+	if limit == 0 {
+		limit = StateLimit
+	}
+	if len(data) > limit {
+		return nil, fmt.Errorf("tool conversation exceeds memory limit")
+	}
+	items := make([]string, 0, len(state.Replacements))
+	for item := range state.Replacements {
+		items = append(items, item)
+	}
+	return &Publication{store: store, key: stateKey{principal, id}, data: data, items: items, pending: true}, nil
+}
+
+func (publication *Publication) Discard() {
+	publication.mu.Lock()
+	defer publication.mu.Unlock()
+	publication.pending = false
+	publication.data, publication.items = nil, nil
+}
+
+func (publication *Publication) Commit() error {
+	publication.mu.Lock()
+	defer publication.mu.Unlock()
+	if !publication.pending {
+		return fmt.Errorf("tool conversation publication is no longer pending")
+	}
+	publication.pending = false
+	defer func() { publication.data, publication.items = nil, nil }()
+	return publication.store.publish(publication.key, publication.data, publication.items)
+}
+
+func (store *Store) Put(principal, id string, state State) error {
+	publication, err := store.Stage(principal, id, state)
 	if err != nil {
 		return err
 	}
+	return publication.Commit()
+}
+
+func (store *Store) publish(key stateKey, data []byte, items []string) error {
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	limit := store.Limit
@@ -79,7 +135,6 @@ func (store *Store) Put(principal, id string, state State) error {
 		store.items = map[stateKey]stateKey{}
 	}
 	store.expire()
-	key := stateKey{principal, id}
 	if _, exists := store.entries[key]; exists {
 		store.remove(key)
 	}
@@ -96,8 +151,8 @@ func (store *Store) Put(principal, id string, state State) error {
 	}
 	store.entries[key] = stateEntry{data, store.now()}
 	store.size += len(data)
-	for item := range state.Replacements {
-		store.items[stateKey{principal, item}] = key
+	for _, item := range items {
+		store.items[stateKey{key.Principal, item}] = key
 	}
 	return nil
 }

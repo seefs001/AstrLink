@@ -1,7 +1,9 @@
 package builtintools
 
 import (
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"time"
 )
@@ -30,13 +32,11 @@ func (e *emitter) event(kind string, fields Object) error {
 	fields["type"] = kind
 	fields["sequence_number"] = e.sequence
 	e.sequence++
-	_, err := fmt.Fprintf(e.writer, "event: %s\ndata: %s\n\n", kind, Text(fields))
-	if err == nil {
-		if f, ok := e.writer.(http.Flusher); ok {
-			f.Flush()
-		}
+	frame := fmt.Sprintf("event: %s\ndata: %s\n\n", kind, Text(fields))
+	if err := e.write(frame); err != nil {
+		return err
 	}
-	return err
+	return e.flush()
 }
 func (e *emitter) start() error {
 	if !e.streaming {
@@ -192,9 +192,27 @@ func (e *emitter) finish() error {
 		return e.event("response."+String(e.response["status"]), Object{"response": e.response})
 	}
 	e.writer.Header().Set("Content-Type", "application/json")
-	_, err := fmt.Fprint(e.writer, Text(e.response))
+	if err := e.write(Text(e.response)); err != nil {
+		return err
+	}
+	return e.flush()
+}
+func (e *emitter) write(body string) error {
+	n, err := io.WriteString(e.writer, body)
+	if err == nil && n != len(body) {
+		return io.ErrShortWrite
+	}
 	return err
 }
+
+func (e *emitter) flush() error {
+	err := http.NewResponseController(e.writer).Flush()
+	if errors.Is(err, http.ErrNotSupported) {
+		return nil
+	}
+	return err
+}
+
 func (e *emitter) fail(err error) error {
 	e.response["status"] = "failed"
 	e.response["output"] = e.output

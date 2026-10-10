@@ -441,6 +441,15 @@ export function TrayPopoverPanel({
               ) : null}
             </div>
           ) : null}
+          <Button
+            className="mt-0.5 h-auto p-0 text-micro"
+            data-slot="tray-tool-review-approvals"
+            onClick={() => onAction({ kind: "tool_review_approval" })}
+            type="button"
+            variant="link"
+          >
+            {t("toolReview.approvals.open")}
+          </Button>
           {view?.pending_raw_access ? (
             // Requests are decided only in the approval window.
             <Button

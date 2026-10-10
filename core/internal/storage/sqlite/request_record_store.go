@@ -250,8 +250,19 @@ usage_json=CASE WHEN usage_json IS NOT NULL AND usage_json<>'null' THEN json_set
 WHERE terminal=0`); err != nil {
 		return 0, fmt.Errorf("recover pending billing entries: %w", err)
 	}
+	// Approval queues and held tool arguments are process-local. A pending
+	// permission cannot survive a restart. Preserve a decision already saved
+	// before delivery, including its unknown/pending delivery action if Core
+	// stopped between publication and the final record write.
+	if _, err = transaction.ExecContext(ctx, `UPDATE request_records SET tool_review_json = json_set(
+    tool_review_json, '$.approval.state', 'interrupted', '$.approval.decided_at', ?
+) WHERE json_extract(tool_review_json, '$.status') = 'pending'
+    AND json_extract(tool_review_json, '$.approval.state') = 'pending'`, completedAt); err != nil {
+		return 0, fmt.Errorf("recover pending tool review approvals: %w", err)
+	}
 	// Review work may outlive an already successful delivery in mark mode.
-	// Recover every pending review, not just pending requests.
+	// Recover every pending review, not just pending requests. Approval's
+	// review_status and per-call verdicts retain the original risk assessment.
 	if _, err = transaction.ExecContext(ctx, `UPDATE request_records SET tool_review_json = json_set(
     tool_review_json, '$.status', 'interrupted', '$.completed_at', ?, '$.error_code', 'core_interrupted'
 ) WHERE json_extract(tool_review_json, '$.status') = 'pending'`, completedAt); err != nil {
@@ -391,6 +402,11 @@ func (store *Store) ListRequestRecords(
 	query.WriteString(`SELECT` + requestRecordSelectColumns + `
 FROM request_records WHERE parent_request_id IS NULL`)
 	args := make([]any, 0, 12)
+	if options.ToolReviewOnly {
+		query.WriteString(` AND json_extract(NULLIF(tool_review_json, ''), '$.status') <> 'not_applicable'
+    AND (json_extract(NULLIF(tool_review_json, ''), '$.status') <> 'pending'
+        OR COALESCE(json_array_length(NULLIF(tool_review_json, ''), '$.calls'), 0) > 0)`)
+	}
 	if options.ToolReviewStatus != "" {
 		if !contract.ValidToolReviewStatus(options.ToolReviewStatus) {
 			return storagecontract.RequestRecordPage{}, fmt.Errorf("%w: invalid tool review status", storagecontract.ErrInvalidArgument)

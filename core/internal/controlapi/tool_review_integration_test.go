@@ -201,7 +201,7 @@ func TestToolReviewIntegrationConfigChangesApplyToNewRequestsOnly(t *testing.T) 
 		}
 		integrationSendTool(w, r)
 	})
-	original := h.patch(t, fmt.Sprintf(`{"enabled":true,"mode":"mark","endpoint":%q,"api_key":%q,"data_transfer_acknowledged":true}`, judge.URL, integrationReviewKey))
+	original := h.patch(t, fmt.Sprintf(`{"enabled":true,"mode":"mark","reject_threshold":0.25,"endpoint":%q,"api_key":%q,"data_transfer_acknowledged":true}`, judge.URL, integrationReviewKey))
 	const request = `{"model":"integration-model","input":"Inspect only"}`
 	delivered := make(chan toolReviewHTTPResult, 1)
 	go func() { delivered <- h.request(http.MethodPost, "/v1/responses", request, "") }()
@@ -210,7 +210,12 @@ func TestToolReviewIntegrationConfigChangesApplyToNewRequestsOnly(t *testing.T) 
 	case <-time.After(5 * time.Second):
 		t.Fatal("request did not reach the provider")
 	}
-	updated := h.patch(t, fmt.Sprintf(`{"mode":"reject","model":"jev-updated","api_key":%q}`, integrationReviewKey+"-rotated"))
+	// Preparation must persist the ordinary request, not an empty review.
+	beforeTools := h.records(t, "")
+	if len(beforeTools) != 1 || beforeTools[0].Status != contract.RequestStatusPending || beforeTools[0].ToolReview != nil || len(h.records(t, "pending")) != 0 {
+		t.Fatalf("request waiting for provider created review metadata: %+v", beforeTools)
+	}
+	updated := h.patch(t, fmt.Sprintf(`{"mode":"reject","reject_threshold":0.75,"model":"jev-updated","api_key":%q}`, integrationReviewKey+"-rotated"))
 	providerOnce.Do(func() { close(releaseProvider) })
 	select {
 	case response := <-delivered:
@@ -226,12 +231,46 @@ func TestToolReviewIntegrationConfigChangesApplyToNewRequestsOnly(t *testing.T) 
 		t.Fatal("in-flight request lost its review when configuration changed")
 	}
 	pending := h.waitForRecord(t, "pending")
-	if pending.Status != contract.RequestStatusSucceeded || pending.ToolReview.ConfigRevision != original.Revision || pending.ToolReview.Mode != contract.ToolReviewModeMark {
+	if pending.Status != contract.RequestStatusSucceeded || pending.ToolReview.ConfigRevision != original.Revision || pending.ToolReview.Mode != contract.ToolReviewModeMark || pending.ToolReview.RejectThreshold == nil || *pending.ToolReview.RejectThreshold != 0.25 {
 		t.Fatalf("pending metadata changed delivery or configuration: %#v", pending)
+	}
+	// The judge barrier holds a real queued mark review after delivery, while
+	// the saved configuration already has a different mode and threshold.
+	queued := h.mustRequest(t, http.MethodGet, RequestsPath+"?tool_review_only=true&tool_review_status=pending", "", "", http.StatusOK)
+	var queuedPage struct {
+		Items []struct {
+			ID         contract.RequestID     `json:"id"`
+			Status     contract.RequestStatus `json:"status"`
+			ToolReview json.RawMessage        `json:"tool_review"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal([]byte(queued.body), &queuedPage); err != nil {
+		t.Fatal(err)
+	}
+	if len(queuedPage.Items) != 1 || queuedPage.Items[0].ID != pending.ID || queuedPage.Items[0].Status != contract.RequestStatusSucceeded {
+		t.Fatalf("queued mark review missing from combined filter: %s", queued.body)
+	}
+	rawReview := queuedPage.Items[0].ToolReview
+	var queuedReview contract.ToolReviewSummary
+	if err := json.Unmarshal(rawReview, &queuedReview); err != nil {
+		t.Fatal(err)
+	}
+	if queuedReview.Status != "pending" || queuedReview.CompletedAt != nil || queuedReview.Mode != contract.ToolReviewModeMark || queuedReview.ConfigRevision != original.Revision || queuedReview.RejectThreshold == nil || *queuedReview.RejectThreshold != original.RejectThreshold || len(queuedReview.Calls) != 1 {
+		t.Fatalf("queued mark review lost its original snapshot or safe calls: %+v", queuedReview)
+	}
+	wantPendingCall := contract.ToolReviewCall{Index: 0, Name: "shell_demo", Model: original.Model, Verdict: "error", Action: "delivered"}
+	if queuedReview.Calls[0] != wantPendingCall {
+		t.Fatalf("queued call metadata = %+v, want %+v", queuedReview.Calls[0], wantPendingCall)
+	}
+	// Inspect the raw API metadata so unknown fields cannot hide a leak during decoding.
+	for _, private := range []string{integrationReviewKey, "private-tool-argument-marker", "Inspect only", `"arguments"`, `"user_request"`, `"api_key"`} {
+		if strings.Contains(string(rawReview), private) {
+			t.Fatal("queued review metadata retained private input or credentials")
+		}
 	}
 	judgeOnce.Do(func() { close(releaseJudge) })
 	flagged := h.waitForRecord(t, "flagged")
-	if flagged.ID != pending.ID || flagged.Status != contract.RequestStatusSucceeded || flagged.ToolReview.ConfigRevision != original.Revision || flagged.ToolReview.Mode != contract.ToolReviewModeMark || len(flagged.ToolReview.Calls) != 1 || flagged.ToolReview.Calls[0].Action != "delivered" {
+	if flagged.ID != pending.ID || flagged.Status != contract.RequestStatusSucceeded || flagged.ToolReview.ConfigRevision != original.Revision || flagged.ToolReview.Mode != contract.ToolReviewModeMark || len(flagged.ToolReview.Calls) != 1 || flagged.ToolReview.Calls[0].Action != "delivered" || flagged.ToolReview.RejectThreshold == nil || *flagged.ToolReview.RejectThreshold != 0.25 {
 		t.Fatalf("async review did not update only the original record metadata: %#v", flagged)
 	}
 	if len(h.records(t, "pending")) != 0 {
@@ -240,7 +279,7 @@ func TestToolReviewIntegrationConfigChangesApplyToNewRequestsOnly(t *testing.T) 
 
 	h.mustRequest(t, http.MethodPost, "/v1/responses", request, "", http.StatusForbidden)
 	blocked := h.waitForRecord(t, "blocked")
-	if blocked.Status != contract.RequestStatusBlocked || blocked.ToolReview.ConfigRevision != updated.Revision || blocked.ToolReview.Mode != contract.ToolReviewModeReject || original.Revision == updated.Revision {
+	if blocked.Status != contract.RequestStatusBlocked || blocked.ToolReview.ConfigRevision != updated.Revision || blocked.ToolReview.Mode != contract.ToolReviewModeReject || original.Revision == updated.Revision || blocked.ToolReview.RejectThreshold == nil || *blocked.ToolReview.RejectThreshold != 0.75 {
 		t.Fatalf("new request ignored updated settings: %#v", blocked)
 	}
 	h.patch(t, `{"enabled":false}`)
@@ -336,5 +375,87 @@ func TestToolReviewIntegrationSavedSettingsGateRequestsAndExposeFilteredRecords(
 	}
 	if len(h.records(t, "passed")) != 0 || len(h.records(t, "")) != 2 || reviews.Load() != 1 {
 		t.Fatal("review filters or default-disabled request history are incorrect")
+	}
+}
+
+func TestToolReviewIntegrationThresholdControlsDeliveryAndPreservesSnapshots(t *testing.T) {
+	judge := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer "+integrationReviewKey {
+			t.Error("review did not use persisted credential")
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"model":"jev-threshold","answers":{
+			"review":{"type":"choice","choice":"flag","probabilities":{"pass":0.4,"flag":0.6},"confidence":0.6},
+			"reason":{"type":"choice","choice":"unclear_authorization","confidence":1,"probabilities":{
+				"authorized":0,"unclear_authorization":1,"unauthorized_action":0,"destructive_action":0,
+				"data_exfiltration":0,"privilege_escalation":0,"untrusted_execution":0,"prompt_injection":0,
+				"unrelated_action":0,"policy_violation":0}}}}`)
+	}))
+	defer judge.Close()
+	h := newToolReviewIntegration(t, integrationSendTool)
+	h.patch(t, fmt.Sprintf(`{"enabled":true,"mode":"reject","endpoint":%q,"api_key":%q,"data_transfer_acknowledged":true}`, judge.URL, integrationReviewKey))
+	type expectedReview struct {
+		threshold float64
+		revision  string
+		status    string
+		verdict   string
+		action    string
+	}
+	expected := make(map[contract.RequestID]expectedReview)
+	for _, tc := range []struct {
+		threshold               float64
+		code                    int
+		status, verdict, action string
+	}{
+		{0.7, http.StatusOK, "passed", "pass", "delivered"},
+		{0.6, http.StatusForbidden, "blocked", "flag", "withheld"},
+		{0, http.StatusForbidden, "blocked", "flag", "withheld"},
+		{1, http.StatusOK, "passed", "pass", "delivered"},
+	} {
+		settings := h.patch(t, fmt.Sprintf(`{"reject_threshold":%v}`, tc.threshold))
+		response := h.mustRequest(t, http.MethodPost, "/v1/responses", `{"model":"integration-model","input":"Inspect only"}`, "", tc.code)
+		if tc.code == http.StatusOK && response.body != integrationToolResponse {
+			t.Fatal("passing threshold changed upstream tool output")
+		}
+		if tc.code == http.StatusForbidden && (!strings.Contains(response.body, "tool_review_blocked") || strings.Contains(response.body, "private-tool-argument-marker")) {
+			t.Fatal("rejecting threshold did not safely withhold tool output")
+		}
+		var added int
+		for _, record := range h.records(t, "") {
+			if _, exists := expected[record.ID]; !exists {
+				expected[record.ID] = expectedReview{tc.threshold, settings.Revision, tc.status, tc.verdict, tc.action}
+				added++
+			}
+		}
+		if added != 1 {
+			t.Fatalf("new request count = %d", added)
+		}
+	}
+	// A later PATCH cannot rewrite the recorded threshold or the raw model verdict.
+	h.patch(t, `{"reject_threshold":0.5}`)
+	req, err := http.NewRequest(http.MethodGet, h.url+RequestsPath+"?tool_review_only=true", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+testObserverToken)
+	response, err := h.client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	var page contract.RequestRecordPage
+	if err := json.NewDecoder(response.Body).Decode(&page); err != nil || response.StatusCode != http.StatusOK || len(page.Items) != len(expected) {
+		t.Fatalf("observer review history: status=%d page=%+v err=%v", response.StatusCode, page, err)
+	}
+	for _, record := range page.Items {
+		want := expected[record.ID]
+		review := record.ToolReview
+		if review == nil || review.RejectThreshold == nil || *review.RejectThreshold != want.threshold || review.ConfigRevision != want.revision || review.Status != want.status || len(review.Calls) != 1 {
+			t.Fatalf("stored threshold snapshot: %+v, want %+v", review, want)
+		}
+		call := review.Calls[0]
+		if call.Verdict != want.verdict || call.ModelVerdict != "flag" || call.ReasonCode != "unclear_authorization" || call.Action != want.action || call.FlagProbability == nil || *call.FlagProbability != 0.6 {
+			t.Fatalf("stored threshold verdict: %+v, want %+v", call, want)
+		}
 	}
 }

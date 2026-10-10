@@ -1,6 +1,5 @@
 import { useWorkspaceSnapshot } from "./workspace-snapshots";
 import { SessionChannelBindings } from "./SessionChannelBindings";
-import { ToolReviewRecords } from "./ToolReviewRecords";
 import { RecoveryChain, RecoveryDetails } from "./components/RecoveryDetails";
 import {
   memo,
@@ -79,6 +78,7 @@ import {
   getRawSealingStatus,
   getRequestAuditContent,
   getRequestSession,
+  getRequestRecord,
   listenRawSealingChanged,
   listRequestRecordChildren,
   listRequestSessions,
@@ -134,6 +134,10 @@ import {
   type RequestSessionKind,
   type SessionStatus,
 } from "./request-record-model";
+import {
+  parseToolReviewJump,
+  type ToolReviewJump,
+} from "./tool-review-navigation";
 import { RequestConversation } from "./RequestConversation";
 import { RequestTrajectory } from "./RequestTrajectory";
 import {
@@ -296,6 +300,7 @@ export function RequestRecords({
   coreSessionKey,
   initialDetailTab = "conversation",
   initialLocalAccessTokenId,
+  toolJump,
   isReady,
   services,
 }: {
@@ -305,6 +310,7 @@ export function RequestRecords({
   /** The reading tab a session opens on until the operator picks one. */
   initialDetailTab?: "conversation" | "trajectory";
   initialLocalAccessTokenId?: string;
+  toolJump?: ToolReviewJump;
   isReady: boolean;
   services: (RoutableService & RequestService)[];
 }) {
@@ -319,7 +325,6 @@ export function RequestRecords({
   );
   const [view, setView] = useState<RecordsView>("monitor");
   const [kind, setKind] = useState<RecordsKind>("inference");
-  const [requestReviewView, setRequestReviewView] = useState(false);
   const [filters, setFilters] = useState<RecordFilters>(() => ({
     ...EMPTY_FILTERS,
     localAccessTokenIds: initialLocalAccessTokenId
@@ -353,6 +358,10 @@ export function RequestRecords({
   // A session whose detail is still on the way; see openDetail.
   const [openingId, setOpeningId] = useState<string | null>(null);
   const [selectedTurnId, setSelectedTurnId] = useState<string | null>(null);
+  const [activeToolJump, setActiveToolJump] = useState<ToolReviewJump | null>(
+    null,
+  );
+  const incomingJumpRef = useRef<string | null>(null);
   const [overlaySessions, setOverlaySessions] = useState<
     Record<string, RequestSessionDetail>
   >({});
@@ -404,12 +413,14 @@ export function RequestRecords({
   const openGenerationRef = useRef(0);
   const selectedIdRef = useRef(selectedId);
   const overlaySessionsRef = useRef(overlaySessions);
+  const overlayRecordsRef = useRef(overlayRecords);
   // A session openDetail has just fetched, so selecting it need not again.
   const freshDetailRef = useRef<string | null>(null);
 
   viewRef.current = view;
   selectedIdRef.current = selectedId;
   overlaySessionsRef.current = overlaySessions;
+  overlayRecordsRef.current = overlayRecords;
 
   const allRecords = useMemo(
     () => [...live.queued, ...live.items],
@@ -470,9 +481,10 @@ export function RequestRecords({
     if (!selectedId) return;
     let cancelled = false;
     const load = async () => {
+      const generation = openGenerationRef.current;
       try {
         const detail = await getRequestSession(selectedId);
-        if (cancelled) return;
+        if (cancelled || openGenerationRef.current !== generation) return;
         setOverlaySessions((current) => {
           const previous = current[detail.id];
           if (
@@ -484,7 +496,11 @@ export function RequestRecords({
           return { ...current, [detail.id]: detail };
         });
         setSelectedTurnId((current) => {
-          if (current && detail.turns.some((turn) => turn.id === current)) {
+          if (
+            current &&
+            (detail.turns.some((turn) => turn.id === current) ||
+              overlayRecordsRef.current[current]?.session_id === detail.id)
+          ) {
             return current;
           }
           return detail.turns[detail.turns.length - 1]?.id ?? null;
@@ -950,8 +966,9 @@ export function RequestRecords({
   // Stable, so the memoized list rows skip the page's re-renders. A session
   // opens once its detail is in hand: switching first blanked the whole
   // workspace, or dropped the session being read, until the detail arrived.
-  const openDetail = useCallback((sessionId: string) => {
+  const openDetail = useCallback((sessionId: string, jump?: ToolReviewJump) => {
     const generation = ++openGenerationRef.current;
+    setActiveToolJump(null);
     const show = (turnId: string | null) => {
       if (viewRef.current === "monitor") {
         monitorScrollTopRef.current = monitorScrollRef.current?.scrollTop ?? 0;
@@ -960,22 +977,53 @@ export function RequestRecords({
       setOpeningId(null);
       setSelectedId(sessionId);
       setSelectedTurnId(turnId);
+      setActiveToolJump(jump ?? null);
       viewRef.current = "detail";
       setView("detail");
     };
-    if (overlaySessionsRef.current[sessionId]) {
+    if (!jump && overlaySessionsRef.current[sessionId]) {
       show(null);
       return;
     }
     setOpeningId(sessionId);
     getRequestSession(sessionId).then(
-      (detail) => {
+      async (detail) => {
         if (openGenerationRef.current !== generation) return;
+        if (jump) {
+          // Session turns contain roots only. A retry must select its own
+          // record, never the root or a similarly named tool there.
+          let target = detail.turns.find((turn) => turn.id === jump.requestId);
+          if (!target && detail.id === jump.sessionId) {
+            try {
+              target = await getRequestRecord(jump.requestId);
+            } catch {
+              // Identity could not be verified. Do not guess another request.
+            }
+          }
+          if (openGenerationRef.current !== generation) return;
+          if (
+            detail.id !== jump.sessionId ||
+            !target ||
+            target.id !== jump.requestId ||
+            target.session_id !== jump.sessionId ||
+            (target.parent_request_id !== null &&
+              !detail.turns.some(
+                (turn) => turn.id === target!.parent_request_id,
+              ))
+          ) {
+            setOpeningId(null);
+            notify.error(i18n.t("toolReview.location.unreliable"));
+            return;
+          }
+          setOverlayRecords((current) => ({ ...current, [target.id]: target }));
+        }
         if (selectedIdRef.current !== sessionId) {
           freshDetailRef.current = sessionId;
         }
         setOverlaySessions((current) => ({ ...current, [detail.id]: detail }));
-        show(detail.turns[detail.turns.length - 1]?.id ?? null);
+        show(
+          jump?.requestId ?? detail.turns[detail.turns.length - 1]?.id ?? null,
+        );
       },
       (requestError: unknown) => {
         if (openGenerationRef.current !== generation) return;
@@ -984,6 +1032,23 @@ export function RequestRecords({
       },
     );
   }, []);
+
+  useEffect(() => {
+    if (!isReady || !toolJump || incomingJumpRef.current === toolJump.nonce)
+      return;
+    const valid = parseToolReviewJump(toolJump);
+    if (!valid) return;
+    incomingJumpRef.current = valid.nonce;
+    openDetail(valid.sessionId, valid);
+  }, [isReady, toolJump, openDetail]);
+
+  useEffect(
+    () => () => {
+      openGenerationRef.current += 1;
+      incomingJumpRef.current = null;
+    },
+    [],
+  );
 
   // Before paint, so going back never flashes the top of the list.
   useLayoutEffect(() => {
@@ -1387,10 +1452,8 @@ export function RequestRecords({
           aria-labelledby="request-records-heading"
           className="flex h-full min-h-0 min-w-0 flex-1 flex-col gap-0 overflow-hidden"
           hidden={view !== "monitor"}
-          value={requestReviewView ? "requests" : kind}
+          value={kind}
           onValueChange={(value) => {
-            setRequestReviewView(value === "requests");
-            if (value === "requests") return;
             setKind(value as RecordsKind);
             setFilters((current) => ({ ...current, protocol: "" }));
             setError(null);
@@ -1481,6 +1544,7 @@ export function RequestRecords({
                   aria-label={t("records.kind")}
                   className="w-full shrink-0 justify-start border-b"
                   variant="line"
+                  scrollable
                 >
                   <TabsTrigger className="flex-none" value="inference">
                     <MessageSquare aria-hidden="true" />
@@ -1493,165 +1557,148 @@ export function RequestRecords({
                   <TabsTrigger className="flex-none" value="all">
                     {t("common.all")}
                   </TabsTrigger>
-                  <TabsTrigger className="flex-none" value="requests">
-                    {t("toolReview.requestsTab")}
-                  </TabsTrigger>
                 </TabsList>
-                {!requestReviewView ? (
-                  <>
-                    {error ? (
-                      <FormMessage className="mt-2.5 shrink-0" tone="error">
-                        {error}
-                      </FormMessage>
-                    ) : null}
-                    {syncWarning ? (
-                      <FormMessage
-                        className="mt-2.5 flex shrink-0 items-center gap-2"
-                        tone="warning"
-                      >
-                        <StatusDot tone="pending" />
-                        {syncWarning}
-                      </FormMessage>
-                    ) : null}
-                    <div className="flex w-full min-w-0 flex-wrap items-center gap-2 border-b bg-background py-2">
-                      <div className="grid min-w-0 flex-1 basis-72 grid-cols-3 gap-2 @[680px]:max-w-4xl @[680px]:grid-cols-5">
-                        <FilterSelect
-                          ariaLabel={t("records.filter", {
-                            label: t("records.status"),
-                          })}
-                          className="w-full"
-                          label={t("records.status")}
-                          onChange={(status) =>
-                            setFilters((current) => ({
-                              ...current,
-                              status: status as SessionStatus | "",
-                            }))
-                          }
-                          options={[
-                            { label: t("common.all"), value: "" },
-                            ...STATUSES.map((status) => ({
-                              label: statusLabel(status),
-                              value: status,
-                            })),
-                          ]}
-                          value={filters.status}
-                        />
-                        <ServiceSelect
-                          ariaLabel={t("records.filter", {
-                            label: t("records.providerFilter"),
-                          })}
-                          className="w-full"
-                          label={t("records.providerFilter")}
-                          onChange={(serviceId) =>
-                            setFilters((current) => ({ ...current, serviceId }))
-                          }
-                          allLabel={t("common.all")}
-                          services={services}
-                          value={filters.serviceId}
-                        />
-                        <FilterSelect
-                          ariaLabel={t("records.filter", {
-                            label: t("records.protocol"),
-                          })}
-                          className="w-full"
-                          label={t("records.protocol")}
-                          onChange={(protocol) =>
-                            setFilters((current) => ({ ...current, protocol }))
-                          }
-                          options={[
-                            { label: t("common.all"), value: "" },
-                            ...protocolOptions.map((protocol) => ({
-                              label: protocolEntryPath(protocol),
-                              value: protocol,
-                            })),
-                          ]}
-                          value={filters.protocol}
-                        />
-                        <FilterSelect
-                          ariaLabel={t("records.filter", {
-                            label: t("records.client"),
-                          })}
-                          className="w-full"
-                          label={t("records.client")}
-                          onChange={(clientType) =>
-                            setFilters((current) => ({
-                              ...current,
-                              clientType: clientType as ClientType | "",
-                            }))
-                          }
-                          options={[
-                            { label: t("common.all"), value: "" },
-                            ...clientOptions.map((clientType) => ({
-                              label: clientTypeName(clientType),
-                              value: clientType,
-                              displayLabel: (
-                                <span className="inline-flex min-w-0 items-center gap-2">
-                                  <ClientTypeIcon
-                                    clientType={clientType}
-                                    decorative
-                                    size={16}
-                                  />
-                                  <span className="truncate">
-                                    {clientTypeName(clientType)}
-                                  </span>
-                                </span>
-                              ),
-                            })),
-                          ]}
-                          value={filters.clientType}
-                        />
-                        <MultiFilterSelect
-                          allLabel={t("common.all")}
-                          ariaLabel={t("records.filter", {
-                            label: t("records.accessToken"),
-                          })}
-                          className="w-full"
-                          clearLabel={t("records.clearTokenFilter")}
-                          disabled={!isReady || !accessTokensReady}
-                          emptyMessage={t("records.noAccessTokenResults")}
-                          label={t("records.accessToken")}
-                          onChange={(localAccessTokenIds) =>
-                            setFilters((current) => ({
-                              ...current,
-                              localAccessTokenIds,
-                            }))
-                          }
-                          options={accessTokenOptions}
-                          searchPlaceholder={t("records.searchAccessTokens")}
-                          selectAllLabel={t("records.selectAllTokens")}
-                          selectedCountLabel={(count) =>
-                            t("records.selectedTokens", { count })
-                          }
-                          value={filters.localAccessTokenIds}
-                        />
-                      </div>
-                      <IconButton
-                        className="ml-auto"
-                        variant="outline"
-                        disabled={!isReady || listStatus === "loading"}
-                        label={t("common.refresh")}
-                        onClick={() => manualPollRef.current?.()}
-                        type="button"
-                      >
-                        <RefreshCw aria-hidden="true" />
-                      </IconButton>
-                    </div>
-                  </>
+                {error ? (
+                  <FormMessage className="mt-2.5 shrink-0" tone="error">
+                    {error}
+                  </FormMessage>
                 ) : null}
+                {syncWarning ? (
+                  <FormMessage
+                    className="mt-2.5 flex shrink-0 items-center gap-2"
+                    tone="warning"
+                  >
+                    <StatusDot tone="pending" />
+                    {syncWarning}
+                  </FormMessage>
+                ) : null}
+                <div className="flex w-full min-w-0 flex-wrap items-center gap-2 border-b bg-background py-2">
+                  <div className="grid min-w-0 flex-1 basis-72 grid-cols-3 gap-2 @[680px]:max-w-4xl @[680px]:grid-cols-5">
+                    <FilterSelect
+                      ariaLabel={t("records.filter", {
+                        label: t("records.status"),
+                      })}
+                      className="w-full"
+                      label={t("records.status")}
+                      onChange={(status) =>
+                        setFilters((current) => ({
+                          ...current,
+                          status: status as SessionStatus | "",
+                        }))
+                      }
+                      options={[
+                        { label: t("common.all"), value: "" },
+                        ...STATUSES.map((status) => ({
+                          label: statusLabel(status),
+                          value: status,
+                        })),
+                      ]}
+                      value={filters.status}
+                    />
+                    <ServiceSelect
+                      ariaLabel={t("records.filter", {
+                        label: t("records.providerFilter"),
+                      })}
+                      className="w-full"
+                      label={t("records.providerFilter")}
+                      onChange={(serviceId) =>
+                        setFilters((current) => ({ ...current, serviceId }))
+                      }
+                      allLabel={t("common.all")}
+                      services={services}
+                      value={filters.serviceId}
+                    />
+                    <FilterSelect
+                      ariaLabel={t("records.filter", {
+                        label: t("records.protocol"),
+                      })}
+                      className="w-full"
+                      label={t("records.protocol")}
+                      onChange={(protocol) =>
+                        setFilters((current) => ({ ...current, protocol }))
+                      }
+                      options={[
+                        { label: t("common.all"), value: "" },
+                        ...protocolOptions.map((protocol) => ({
+                          label: protocolEntryPath(protocol),
+                          value: protocol,
+                        })),
+                      ]}
+                      value={filters.protocol}
+                    />
+                    <FilterSelect
+                      ariaLabel={t("records.filter", {
+                        label: t("records.client"),
+                      })}
+                      className="w-full"
+                      label={t("records.client")}
+                      onChange={(clientType) =>
+                        setFilters((current) => ({
+                          ...current,
+                          clientType: clientType as ClientType | "",
+                        }))
+                      }
+                      options={[
+                        { label: t("common.all"), value: "" },
+                        ...clientOptions.map((clientType) => ({
+                          label: clientTypeName(clientType),
+                          value: clientType,
+                          displayLabel: (
+                            <span className="inline-flex min-w-0 items-center gap-2">
+                              <ClientTypeIcon
+                                clientType={clientType}
+                                decorative
+                                size={16}
+                              />
+                              <span className="truncate">
+                                {clientTypeName(clientType)}
+                              </span>
+                            </span>
+                          ),
+                        })),
+                      ]}
+                      value={filters.clientType}
+                    />
+                    <MultiFilterSelect
+                      allLabel={t("common.all")}
+                      ariaLabel={t("records.filter", {
+                        label: t("records.accessToken"),
+                      })}
+                      className="w-full"
+                      clearLabel={t("records.clearTokenFilter")}
+                      disabled={!isReady || !accessTokensReady}
+                      emptyMessage={t("records.noAccessTokenResults")}
+                      label={t("records.accessToken")}
+                      onChange={(localAccessTokenIds) =>
+                        setFilters((current) => ({
+                          ...current,
+                          localAccessTokenIds,
+                        }))
+                      }
+                      options={accessTokenOptions}
+                      searchPlaceholder={t("records.searchAccessTokens")}
+                      selectAllLabel={t("records.selectAllTokens")}
+                      selectedCountLabel={(count) =>
+                        t("records.selectedTokens", { count })
+                      }
+                      value={filters.localAccessTokenIds}
+                    />
+                  </div>
+                  <IconButton
+                    className="ml-auto"
+                    variant="outline"
+                    disabled={!isReady || listStatus === "loading"}
+                    label={t("common.refresh")}
+                    onClick={() => manualPollRef.current?.()}
+                    type="button"
+                  >
+                    <RefreshCw aria-hidden="true" />
+                  </IconButton>
+                </div>
               </>
             }
           >
             <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
-              <TabsContent
-                value="requests"
-                className="min-h-0 min-w-0 flex-1 overflow-hidden"
-              >
-                <ToolReviewRecords
-                  coreSessionKey={coreSessionKey}
-                  isReady={isReady}
-                  localAccessTokenIds={filters.localAccessTokenIds}
-                />
-              </TabsContent>
               <TabsContent
                 value={kind}
                 className="@container/request-list min-h-0 min-w-0 flex-1 overflow-x-hidden overflow-y-auto overscroll-contain"
@@ -1776,7 +1823,12 @@ export function RequestRecords({
             onRegisterRecords={(records) =>
               setOverlayRecords((current) => ({ ...current, ...records }))
             }
-            onSelectTurn={setSelectedTurnId}
+            onSelectTurn={(id) => {
+              openGenerationRef.current += 1;
+              setActiveToolJump(null);
+              setSelectedTurnId(id);
+            }}
+            toolJump={activeToolJump}
             onUnlockRaw={() => void unlockRawContent()}
             rawSealing={rawSealing}
             record={selected}
@@ -2158,6 +2210,7 @@ const SessionRow = memo(function SessionRow({
 });
 
 function RecordDetail({
+  toolJump,
   serviceNames,
   services,
   record,
@@ -2182,6 +2235,7 @@ function RecordDetail({
   onRegisterRecords,
   onUnlockRaw,
 }: {
+  toolJump: ToolReviewJump | null;
   record: RequestRecord;
   serviceNames: Record<string, string>;
   services: RequestServiceMap;
@@ -2222,6 +2276,7 @@ function RecordDetail({
       ? "trajectory"
       : rememberedTab;
   const [detailTab, setDetailTabState] = useState<DetailTab>(defaultTab);
+  const [dockedInspectorVisible, setDockedInspectorVisible] = useState(false);
   const setDetailTab = (tab: DetailTab) => {
     setDetailTabState(tab);
     if (tab === "conversation" || tab === "trajectory") setRememberedTab(tab);
@@ -2247,6 +2302,11 @@ function RecordDetail({
     setDetailTabState(defaultTab);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [session.id]);
+
+  useEffect(() => {
+    if (toolJump?.sessionId === session.id && toolJump.requestId === record.id)
+      setDetailTabState("conversation");
+  }, [toolJump, session.id, record.id]);
 
   // One request per root that retried, so this must not re-run on a new `turns`
   // array alone: a conversation with 95 turns would refire a burst of calls
@@ -2613,6 +2673,7 @@ function RecordDetail({
             </TabsTrigger>
           </TabsList>
           <dl
+            hidden={detailTab === "trajectory" && dockedInspectorVisible}
             data-testid="session-performance"
             className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-micro text-muted-foreground [&>div+div]:before:mr-2 [&>div+div]:before:text-border [&>div+div]:before:content-['·']"
           >
@@ -2755,6 +2816,7 @@ function RecordDetail({
             value="conversation"
           >
             <RequestConversation
+              toolJump={toolJump}
               auditContent={auditContent}
               auditError={auditError}
               auditLoading={auditLoading}
@@ -2777,6 +2839,7 @@ function RecordDetail({
           value="trajectory"
         >
           <RequestTrajectory
+            onDockedInspectorVisibilityChange={setDockedInspectorVisible}
             auditContent={auditContent}
             auditError={auditError}
             auditLoading={auditLoading}

@@ -6,15 +6,25 @@ export function HelpDisclosure({
   title,
   children,
   open,
+  onOpenChange,
   tone = "neutral",
 }: {
   title: ReactNode;
   children: ReactNode;
   open?: boolean;
+  onOpenChange?: (open: boolean) => void;
   tone?: "neutral" | "warning";
 }) {
   return (
-    <details className="group/details min-w-0 text-xs" open={open}>
+    <details
+      className="group/details min-w-0 text-xs"
+      open={open}
+      onToggle={
+        onOpenChange
+          ? (event) => onOpenChange(event.currentTarget.open)
+          : undefined
+      }
+    >
       <summary
         className={cn(
           "flex w-fit cursor-pointer list-none items-center gap-1.5 rounded-sm transition-colors hover:text-foreground focus-visible:outline-2 focus-visible:outline-ring [&::-webkit-details-marker]:hidden",

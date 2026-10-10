@@ -81,7 +81,9 @@ func (handler *Handler) tryBuiltinTools(writer http.ResponseWriter, request *htt
 			mainMode.Model = state.RoutingModel
 		}
 		return nil
-	}, Binding: func() (string, string) { return string(mainMode.Target), mainMode.Model }, Store: &handler.builtinStates, Executor: handler.builtinExecutor(request, classified), Model: func(ctx context.Context, body builtintools.Object) (builtintools.Object, error) {
+	}, Binding: func() (string, string) { return string(mainMode.Target), mainMode.Model }, Store: &handler.builtinStates, DeferPublication: func(publication *builtintools.Publication) {
+		session.builtinPublication = publication
+	}, Executor: handler.builtinExecutor(request, classified), Model: func(ctx context.Context, body builtintools.Object) (builtintools.Object, error) {
 		return handler.builtinModel(ctx, request, body, mainMode)
 	}, Observe: func(kind string, config contract.BuiltinTool, started time.Time, result builtintools.Result, err error) {
 		session.noteBuiltinTool(kind, config, started, result, err)
@@ -107,9 +109,13 @@ func (handler *Handler) tryBuiltinTools(writer http.ResponseWriter, request *htt
 		}
 	} else if session.status == contract.RequestStatusPending {
 		session.toolReviewEOF = ctx.Err() == nil
-		if session.toolReview != nil {
+		if session.toolReviewActive {
 			session.afterToolReview = session.noteSucceeded
 		} else {
+			if err := confirmClientDelivery(writer); err != nil {
+				session.noteFailed(errorSummaryFromInference("client_delivery_failed", "builtin response could not be delivered", false))
+				return true
+			}
 			session.noteSucceeded()
 		}
 	}

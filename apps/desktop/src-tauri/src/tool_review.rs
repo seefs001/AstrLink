@@ -1,4 +1,18 @@
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Backend {
+    Jev,
+    Responses,
+}
+
+pub fn deserialize_optional_backend<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Backend>, D::Error> {
+    Backend::deserialize(deserializer).map(Some)
+}
 
 const INVALID: &str = "invalid tool review settings";
 
@@ -31,7 +45,8 @@ pub(crate) fn validate_settings(value: &Value, patch: bool) -> Result<(), String
     }
     for (key, value) in object {
         let valid = match key.as_str() {
-            "enabled" => value.is_boolean(),
+            "backend" => matches!(value.as_str(), Some("jev" | "responses")),
+            "enabled" | "ask_on_review_error" | "batch_calls" => value.is_boolean(),
             "endpoint" => value.as_str().is_some_and(|value| {
                 value.len() <= 4096
                     && value == value.trim()
@@ -50,10 +65,16 @@ pub(crate) fn validate_settings(value: &Value, patch: bool) -> Result<(), String
                     && value.contains("{{user_request}}")
                     && value.contains("{{tool_call}}")
             }),
-            "mode" => matches!(value.as_str(), Some("mark" | "reject")),
+            "mode" => matches!(value.as_str(), Some("mark" | "reject" | "ask")),
+            "reject_threshold" => value
+                .as_f64()
+                .is_some_and(|value| value.is_finite() && (0.0..=1.0).contains(&value)),
             "timeout_ms" => value
                 .as_u64()
                 .is_some_and(|value| (1..=120000).contains(&value)),
+            "approval_timeout_ms" => value
+                .as_u64()
+                .is_some_and(|value| (1000..=600000).contains(&value)),
             "revision" if !patch => bounded_text(value, 128),
             "credential_configured" if !patch => value.is_boolean(),
             "api_key" if patch => {
@@ -88,8 +109,18 @@ fn bounded_text(value: &Value, max: usize) -> bool {
 }
 
 pub(crate) fn settings_record(etag: String, body: &[u8]) -> Result<Value, String> {
-    let settings: Value = serde_json::from_slice(body).map_err(|_| INVALID)?;
+    let mut settings: Value = serde_json::from_slice(body).map_err(|_| INVALID)?;
     validate_settings(&settings, false)?;
+    settings
+        .as_object_mut()
+        .ok_or(INVALID)?
+        .entry("backend")
+        .or_insert(Value::String("jev".into()));
+    settings
+        .as_object_mut()
+        .ok_or(INVALID)?
+        .entry("batch_calls")
+        .or_insert(Value::Bool(false));
     Ok(json!({"settings": settings, "etag": etag}))
 }
 
@@ -109,6 +140,183 @@ mod tests {
             settings["timeout_ms"] = timeout.clone();
             assert!(validate_settings(&settings, false).is_err());
             assert!(validate_settings(&json!({"timeout_ms":timeout}), true).is_err());
+        }
+    }
+
+    #[test]
+    fn reject_threshold_is_optional_and_bounded_for_reads_and_patches() {
+        let mut settings = json!({"enabled":false,"endpoint":"https://api.typesafe.ai/v1/systemone","model":"jev-latest","prompt":"{{user_request}}\n{{tool_call}}","mode":"mark","timeout_ms":5000,"revision":"r1","credential_configured":true});
+        let record =
+            settings_record("etag".into(), &serde_json::to_vec(&settings).unwrap()).unwrap();
+        let mut expected = settings.clone();
+        expected["batch_calls"] = json!(false);
+        expected["backend"] = json!("jev");
+        assert_eq!(record["settings"], expected);
+        assert!(record["settings"].get("reject_threshold").is_none());
+        assert!(validate_settings(&json!({"enabled":false}), true).is_ok());
+        for threshold in [json!(0), json!(0.0), json!(0.5), json!(1), json!(1.0)] {
+            settings["reject_threshold"] = threshold.clone();
+            assert!(validate_settings(&settings, false).is_ok());
+            assert!(validate_settings(&json!({"reject_threshold":threshold}), true).is_ok());
+            let record =
+                settings_record("etag".into(), &serde_json::to_vec(&settings).unwrap()).unwrap();
+            assert_eq!(record["settings"]["reject_threshold"], threshold);
+        }
+        for threshold in [
+            json!(null),
+            json!("0.5"),
+            json!(true),
+            json!([]),
+            json!({}),
+            json!(-0.001),
+            json!(1.001),
+        ] {
+            settings["reject_threshold"] = threshold.clone();
+            assert_eq!(validate_settings(&settings, false).unwrap_err(), INVALID);
+            assert_eq!(
+                validate_settings(&json!({"reject_threshold":threshold}), true).unwrap_err(),
+                INVALID
+            );
+            assert_eq!(
+                settings_record("etag".into(), &serde_json::to_vec(&settings).unwrap())
+                    .unwrap_err(),
+                INVALID
+            );
+        }
+    }
+
+    #[test]
+    fn ask_settings_accept_optional_legacy_fields_and_strict_new_values() {
+        let mut settings = json!({"enabled":false,"endpoint":"https://api.typesafe.ai/v1/systemone","model":"jev-latest","prompt":"{{user_request}}\n{{tool_call}}","mode":"ask","timeout_ms":5000,"revision":"r1","credential_configured":true});
+        assert!(validate_settings(&settings, false).is_ok());
+        assert!(validate_settings(&json!({"mode":"ask"}), true).is_ok());
+        for ask_on_review_error in [json!(false), json!(true)] {
+            settings["ask_on_review_error"] = ask_on_review_error.clone();
+            assert!(validate_settings(&settings, false).is_ok());
+            assert!(
+                validate_settings(&json!({"ask_on_review_error":ask_on_review_error}), true)
+                    .is_ok()
+            );
+        }
+        for approval_timeout_ms in [json!(1000), json!(120000), json!(600000)] {
+            settings["approval_timeout_ms"] = approval_timeout_ms.clone();
+            assert!(validate_settings(&settings, false).is_ok());
+            assert!(
+                validate_settings(&json!({"approval_timeout_ms":approval_timeout_ms}), true)
+                    .is_ok()
+            );
+        }
+        for (key, invalid_values) in [
+            (
+                "ask_on_review_error",
+                vec![json!(null), json!(0), json!("false")],
+            ),
+            (
+                "approval_timeout_ms",
+                vec![
+                    json!(null),
+                    json!(999),
+                    json!(600001),
+                    json!(1000.5),
+                    json!("120000"),
+                ],
+            ),
+        ] {
+            for value in invalid_values {
+                let mut invalid = settings.clone();
+                invalid[key] = value.clone();
+                assert_eq!(validate_settings(&invalid, false).unwrap_err(), INVALID);
+                assert_eq!(
+                    validate_settings(&json!({key:value}), true).unwrap_err(),
+                    INVALID
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn backend_defaults_only_legacy_settings_and_rejects_unknown_read_and_patch_values() {
+        let settings = json!({"enabled":false,"endpoint":"https://api.typesafe.ai/v1/systemone","model":"jev-latest","prompt":"{{user_request}}\n{{tool_call}}","mode":"ask","timeout_ms":5000,"revision":"r1","credential_configured":true});
+        let record =
+            settings_record("etag".into(), &serde_json::to_vec(&settings).unwrap()).unwrap();
+        assert_eq!(record["settings"]["backend"], "jev");
+        for backend in [json!("jev"), json!("responses")] {
+            let mut current = settings.clone();
+            current["backend"] = backend.clone();
+            assert!(validate_settings(&json!({"backend":backend}), true).is_ok());
+            let record =
+                settings_record("etag".into(), &serde_json::to_vec(&current).unwrap()).unwrap();
+            assert_eq!(record["settings"]["backend"], backend);
+        }
+        for backend in [
+            json!(null),
+            json!(""),
+            json!("openai"),
+            json!("Responses"),
+            json!(true),
+            json!(0),
+        ] {
+            let mut current = settings.clone();
+            current["backend"] = backend.clone();
+            assert_eq!(
+                validate_settings(&json!({"backend":backend}), true).unwrap_err(),
+                INVALID
+            );
+            assert_eq!(
+                settings_record("etag".into(), &serde_json::to_vec(&current).unwrap()).unwrap_err(),
+                INVALID
+            );
+        }
+    }
+
+    #[test]
+    fn batch_calls_defaults_only_legacy_settings_and_accepts_strict_booleans() {
+        let settings = json!({"enabled":false,"endpoint":"https://api.typesafe.ai/v1/systemone","model":"jev-latest","prompt":"{{user_request}}\n{{tool_call}}","mode":"ask","timeout_ms":5000,"revision":"r1","credential_configured":true});
+        let record =
+            settings_record("etag".into(), &serde_json::to_vec(&settings).unwrap()).unwrap();
+        assert_eq!(record["settings"]["batch_calls"], false);
+        for value in [json!(false), json!(true)] {
+            let mut current = settings.clone();
+            current["batch_calls"] = value.clone();
+            assert!(validate_settings(&json!({"batch_calls":value}), true).is_ok());
+            let record =
+                settings_record("etag".into(), &serde_json::to_vec(&current).unwrap()).unwrap();
+            assert_eq!(record["settings"]["batch_calls"], value);
+        }
+        for value in [
+            json!(null),
+            json!(0),
+            json!(1),
+            json!("false"),
+            json!([]),
+            json!({}),
+        ] {
+            let mut current = settings.clone();
+            current["batch_calls"] = value.clone();
+            assert_eq!(
+                validate_settings(&json!({"batch_calls":value}), true).unwrap_err(),
+                INVALID
+            );
+            assert_eq!(
+                settings_record("etag".into(), &serde_json::to_vec(&current).unwrap()).unwrap_err(),
+                INVALID
+            );
+        }
+    }
+
+    #[test]
+    fn settings_record_errors_never_expose_keys_or_body() {
+        for body in [
+            r#"{"reject_threshold":NaN,"api_key":"private-test-key"}"#,
+            r#"{"reject_threshold":Infinity,"api_key":"private-test-key"}"#,
+            r#"{"reject_threshold":1e999,"api_key":"private-test-key"}"#,
+            r#"{"private-test-key":"private-test-body"}"#,
+            "private-test-body",
+        ] {
+            assert_eq!(
+                settings_record("etag".into(), body.as_bytes()).unwrap_err(),
+                INVALID
+            );
         }
     }
 

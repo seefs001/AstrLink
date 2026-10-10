@@ -111,6 +111,9 @@ x-astrlink-implementation:
     - GET /control/v1/requests/{request_id}/audit
     - POST /control/v1/requests/{request_id}/audit/raw-access
     - GET /control/v1/audit/raw-access
+    - GET /control/v1/tool-review/approvals
+    - GET /control/v1/tool-review/approvals/{approval_id}
+    - POST /control/v1/tool-review/approvals/{approval_id}/decision
     - DELETE /control/v1/audit/raw-access/{grant_id}
     - POST /control/v1/audit/raw-access/{grant_id}/decision
     - GET /control/v1/audit/raw-grant
@@ -2230,7 +2233,7 @@ paths:
       tags: [Policies]
       operationId: getToolReviewSettings
       summary: Read independent global client-tool review settings.
-      description: Operators receive complete non-secret settings and an ETag. Observers receive only enabled, mode, model, timeout_ms, revision and credential_configured, without endpoint, prompt or ETag. The API key is never returned.
+      description: Operators receive complete non-secret settings and an ETag. Observers receive backend, enabled, mode, model, reject_threshold, timeout_ms, batch_calls, ask_on_review_error, approval_timeout_ms, revision and credential_configured, without endpoint, prompt or ETag. The API key is never returned.
       responses:
         "200":
           description: Settings or observer-safe summary. Disabled by default.
@@ -2256,16 +2259,41 @@ paths:
       summary: Atomically update tool review configuration and its sealed API key.
       description: |
         Requires the current strong ETag. Each successful update changes revision.
-        Omitted api_key preserves the credential; an empty string clears it.
-        Enabled settings require a key. Null and unknown fields are rejected.
-        Enabling review, or changing the endpoint while review stays enabled, requires
+        Omitted api_key preserves the credential unless backend changes. A change
+        of backend with an existing key requires explicit replacement, or clearing
+        with an empty string while disabled. Enabled settings require a key.
+        Null and unknown fields are rejected. Enabling review, or changing the
+        endpoint or backend while review stays enabled, requires
         data_transfer_acknowledged=true because complete user requests and tool
         arguments leave the device. Acknowledgement is not persisted.
         In-flight requests retain one configuration and credential snapshot.
         Mark mode delivers without waiting; rejection mode buffers from the first
         client tool event and withholds the batch on any flag or review failure.
+        Ask mode holds the same complete batch for a one-time operator decision
+        when flagged. Review-service failures request permission only when
+        ask_on_review_error is true (default false). Invalid or incomplete tool
+        output, input limits and invalid configuration cannot be overridden.
+        Approval waits independently of the review timeout, default 120000 ms,
+        configurable from 1000 to 600000 ms. Denial, expiry, cancellation or
+        restart never release the batch. A saved approval is not proof of delivery.
         Only client function/custom tools are reviewed, not hosted or built-in tools.
-        Review uses fixed pass/flag choices without thresholds or automatic retries.
+        Review returns fixed pass/flag model choices and a reason classification,
+        not free text. The effective verdict is flag when flag_probability >=
+        reject_threshold, otherwise pass; model_verdict preserves the model choice.
+        Invalid reason classifications fail closed; legacy responses may omit reason.
+        Delivery action is independent of the verdict. No automatic retries.
+        Backend defaults to jev, using SystemOne choice questions. The responses
+        backend posts to the configured complete endpoint URL using non-streaming
+        OpenAI-compatible text.format json_schema with strict=true and store=false.
+        It requires a completed structured result for every original call index;
+        refusals, incomplete output and invalid results fail review. Responses
+        probabilities are model-reported scores, not equivalent to Jev classifier
+        probabilities. Both backends use the same threshold and approval policy.
+        With batch_calls=true, all calls in one response share a single review
+        HTTP request with independently matched results per call.
+        The default false preserves one review request per tool call. The complete
+        batch must fit the rendered-input limit; it is never split or retried as
+        individual calls. Missing, extra or malformed batch answers fail review.
         Limits are 128 KiB rendered input, 8 MiB buffered response, 64 calls,
         120 seconds collection. Review timeout includes queue time, defaults to
         5000 ms, and is configurable from 1 to 120000 ms.
@@ -2303,6 +2331,121 @@ paths:
           description: If-Match is required.
         "503":
           description: Tool review settings store is unavailable.
+  /control/v1/tool-review/approvals:
+    x-astrlink-implementation-status: implemented
+    get:
+      x-astrlink-role: operator
+      tags: [Policies]
+      operationId: listToolReviewApprovals
+      summary: List pending one-time tool-batch permissions.
+      description: Bounded process-local queue. Returns safe metadata, never user text or tool arguments. Observers and inference callers cannot list or decide approvals.
+      responses:
+        "200":
+          description: Pending approvals. Empty after Core restarts.
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/NoStore"
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    maxItems: 16
+                    items:
+                      $ref: "#/components/schemas/ToolReviewApprovalRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "503":
+          description: Approval queue unavailable.
+  /control/v1/tool-review/approvals/{approval_id}:
+    x-astrlink-implementation-status: implemented
+    parameters:
+      - name: approval_id
+        in: path
+        required: true
+        schema:
+          $ref: "#/components/schemas/ToolReviewApproval/properties/id"
+    get:
+      x-astrlink-role: operator
+      tags: [Policies]
+      operationId: getToolReviewApprovalDetail
+      summary: Read ephemeral arguments for a pending tool batch.
+      description: Requires an operator and the existing raw-content unlock session. Does not unlock content, issue raw grants or persist approval bodies. Disappears on decision, expiry, cancellation or restart.
+      responses:
+        "200":
+          description: Ephemeral original user request and tool arguments.
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/NoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ToolReviewApprovalDetail"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "410":
+          description: Approval is no longer pending or does not exist.
+        "423":
+          description: Raw content is locked or unavailable (raw_locked).
+        "503":
+          description: Approval queue unavailable.
+  /control/v1/tool-review/approvals/{approval_id}/decision:
+    x-astrlink-implementation-status: implemented
+    parameters:
+      - name: approval_id
+        in: path
+        required: true
+        schema:
+          $ref: "#/components/schemas/ToolReviewApproval/properties/id"
+    post:
+      x-astrlink-role: operator
+      tags: [Policies]
+      operationId: decideToolReviewApproval
+      summary: Allow or deny the current buffered batch once.
+      description: No retry, permanent exception, model reclassification or raw-content grant. Closing a desktop window decides nothing. A late or duplicate decision is rejected; permission must be persisted before delivery, and a decision does not prove delivery succeeded.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [decision]
+              properties:
+                decision:
+                  type: string
+                  enum: [allow, deny]
+      responses:
+        "200":
+          description: Accepted decision. The original model verdict remains unchanged.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ToolReviewApproval"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          description: Approval already decided.
+        "410":
+          description: Approval expired, cancelled or absent.
+        "415":
+          description: Requires application/json.
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+        "503":
+          description: Approval queue unavailable.
   /control/v1/routing-settings:
     x-astrlink-implementation-status: implemented
     get:
@@ -2501,9 +2644,23 @@ paths:
           in: query
           schema:
             $ref: "#/components/schemas/RequestStatus"
+        - name: tool_review_only
+          in: query
+          required: false
+          description: |
+            Accepts only the literal strings true or false; other values are rejected.
+            When true, filters root records in SQL before pagination, excluding empty
+            or null review metadata, null review status, not_applicable,
+            and pending reviews with no calls. Failed, interrupted and cancelled
+            reviews remain eligible even with no calls. False or omission disables
+            this filter. Combined with tool_review_status using AND. Not supported
+            on request sessions.
+          schema:
+            type: string
+            enum: ["true", "false"]
         - name: tool_review_status
           in: query
-          description: Match the root request's review status independently of delivery status. Historical records without review metadata do not match. Not supported on request sessions.
+          description: Match the root request's review status independently of delivery status. Historical records without review metadata do not match. Combined with tool_review_only using AND before pagination. Not supported on request sessions.
           schema:
             $ref: "#/components/schemas/ToolReviewStatus"
         - name: q
@@ -6034,7 +6191,7 @@ components:
       description: Best-effort client label from original inbound headers, before upstream identity rewriting. Display metadata only; never an authenticated identity. Unknown means no recognized signature. Historical records omit this field.
     ToolReviewMode:
       type: string
-      enum: [mark, reject]
+      enum: [mark, reject, ask]
     ToolReviewStatus:
       type: string
       enum:
@@ -6048,12 +6205,31 @@ components:
           cancelled,
           not_applicable,
         ]
+    ToolReviewBackend:
+      type: string
+      enum: [jev, responses]
+      description: Jev SystemOne or OpenAI-compatible Responses structured output. Independent of delivery mode and batch_calls.
     ToolReviewSettingsSummary:
       type: object
       additionalProperties: false
       required:
-        [enabled, mode, model, timeout_ms, revision, credential_configured]
+        [
+          backend,
+          enabled,
+          mode,
+          model,
+          reject_threshold,
+          timeout_ms,
+          batch_calls,
+          ask_on_review_error,
+          approval_timeout_ms,
+          revision,
+          credential_configured,
+        ]
       properties:
+        backend:
+          $ref: "#/components/schemas/ToolReviewBackend"
+          default: jev
         enabled:
           type: boolean
           default: false
@@ -6073,21 +6249,37 @@ components:
           type: string
         credential_configured:
           type: boolean
+        reject_threshold:
+          $ref: "#/components/schemas/ToolReviewSettings/properties/reject_threshold"
+        batch_calls:
+          $ref: "#/components/schemas/ToolReviewSettings/properties/batch_calls"
+        ask_on_review_error:
+          $ref: "#/components/schemas/ToolReviewSettings/properties/ask_on_review_error"
+        approval_timeout_ms:
+          $ref: "#/components/schemas/ToolReviewSettings/properties/approval_timeout_ms"
     ToolReviewSettings:
       type: object
       additionalProperties: false
       required:
         [
+          backend,
           enabled,
           endpoint,
           model,
           prompt,
           mode,
+          reject_threshold,
           timeout_ms,
+          batch_calls,
+          ask_on_review_error,
+          approval_timeout_ms,
           revision,
           credential_configured,
         ]
       properties:
+        backend:
+          $ref: "#/components/schemas/ToolReviewBackend"
+          default: jev
         enabled:
           type: boolean
           default: false
@@ -6096,7 +6288,7 @@ components:
           format: uri
           maxLength: 4096
           default: https://api.typesafe.ai/v1/systemone
-          description: HTTP(S) endpoint without URL credentials, query or fragment.
+          description: Complete HTTP(S) endpoint without URL credentials, query or fragment. Used verbatim, without appending a path. Responses-compatible services normally use /v1/responses.
         model:
           type: string
           minLength: 1
@@ -6109,6 +6301,12 @@ components:
         mode:
           $ref: "#/components/schemas/ToolReviewMode"
           default: mark
+        reject_threshold:
+          type: number
+          minimum: 0
+          maximum: 1
+          default: 0.5
+          description: Finite rejection threshold. A valid review is flagged when flag_probability >= reject_threshold, otherwise it passes. Snapshotted once per request.
         timeout_ms:
           type: integer
           minimum: 1
@@ -6120,11 +6318,27 @@ components:
         credential_configured:
           type: boolean
           readOnly: true
+        batch_calls:
+          type: boolean
+          default: false
+          description: Review every client tool in one response with a single HTTP request. Results remain per-call; the entire rendered input must fit 128 KiB. No automatic splitting or fallback to per-call requests.
+        ask_on_review_error:
+          type: boolean
+          default: false
+          description: In ask mode, request one-time permission on review-service failures. Never overrides malformed tools, collection or input limits, or invalid configuration.
+        approval_timeout_ms:
+          type: integer
+          minimum: 1000
+          maximum: 600000
+          default: 120000
+          description: Independent operator waiting budget, snapshotted per request.
     ToolReviewSettingsPatch:
       type: object
       additionalProperties: false
       minProperties: 1
       properties:
+        backend:
+          $ref: "#/components/schemas/ToolReviewBackend"
         enabled:
           type: boolean
         endpoint:
@@ -6137,11 +6351,24 @@ components:
           $ref: "#/components/schemas/ToolReviewMode"
         timeout_ms:
           $ref: "#/components/schemas/ToolReviewSettings/properties/timeout_ms"
+        batch_calls:
+          type: boolean
+        ask_on_review_error:
+          type: boolean
+        approval_timeout_ms:
+          type: integer
+          minimum: 1000
+          maximum: 600000
+        reject_threshold:
+          type: number
+          minimum: 0
+          maximum: 1
+          description: Finite rejection threshold. Omit to preserve the current setting.
         api_key:
           type: string
           maxLength: 16384
           writeOnly: true
-          description: Omit to preserve; empty clears. Stored only as a sealed secret, never echoed. Enabled settings cannot have an empty key.
+          description: Omit to preserve when backend is unchanged; empty clears. Switching backend with a stored credential requires explicit replacement or clearing. Stored only as a sealed secret, never echoed. Enabled settings cannot have an empty key.
         data_transfer_acknowledged:
           type: boolean
           default: false
@@ -6161,6 +6388,25 @@ components:
         verdict:
           type: string
           enum: [pass, flag, error]
+          description: Effective verdict, independent of delivery action. For a valid review, flag when flag_probability >= the request's reject_threshold, otherwise pass. Review failures, including invalid reason classifications, produce error and fail closed in reject mode.
+        model_verdict:
+          type: string
+          enum: [pass, flag]
+          description: Original model choice, independent of the threshold-based verdict. May be absent in historical records or failed reviews.
+        reason_code:
+          type: string
+          enum:
+            - authorized
+            - unclear_authorization
+            - unauthorized_action
+            - destructive_action
+            - data_exfiltration
+            - privilege_escalation
+            - untrusted_execution
+            - prompt_injection
+            - unrelated_action
+            - policy_violation
+          description: Model-provided reason classification, not free text. Legacy responses without reason may omit this field; an invalid reason fails review closed and is never stored as a reason_code.
         pass_probability:
           type: number
           minimum: 0
@@ -6169,9 +6415,11 @@ components:
           type: number
           minimum: 0
           maximum: 1
+          description: Jev classifier probability or a Responses model-reported risk score. The shared rejection threshold applies, but scores from different backends are not asserted to be calibrated or interchangeable.
         action:
           type: string
           enum: [delivered, withheld, pending]
+          description: Actual delivery state, independent of model_verdict and the effective verdict.
         latency_ms:
           type: integer
           minimum: 0
@@ -6187,8 +6435,11 @@ components:
       additionalProperties: false
       required:
         [status, mode, model, config_revision, started_at, latency_ms, calls]
-      description: Review metadata only. Never stores user requests, tool arguments, review prompts, keys or raw upstream errors. Pending reviews become interrupted after restart even when delivery already succeeded.
+      description: Review metadata only. Requests with no client tool review omit this field; preparation does not create an empty pending summary. Historical not_applicable and empty pending summaries remain readable. Actual collection or review failures remain recorded, including when no complete calls are available. Never stores user requests, tool arguments, review prompts, keys or raw upstream errors. Pending reviews become interrupted after restart even when delivery already succeeded.
       properties:
+        backend:
+          $ref: "#/components/schemas/ToolReviewBackend"
+          description: Backend snapshotted for this review. Historical absence means unknown and must not be defaulted to Jev or the current setting.
         status:
           $ref: "#/components/schemas/ToolReviewStatus"
         mode:
@@ -6200,6 +6451,11 @@ components:
         config_revision:
           type: string
           maxLength: 128
+        reject_threshold:
+          type: number
+          minimum: 0
+          maximum: 1
+          description: Finite threshold snapshotted for this request. Historical records may omit it; absence means unknown and must not be defaulted to an old threshold or the current setting.
         started_at:
           type: string
           format: date-time
@@ -6216,6 +6472,91 @@ components:
             $ref: "#/components/schemas/ToolReviewCall"
         error_code:
           $ref: "#/components/schemas/ToolReviewCall/properties/error_code"
+        approval:
+          $ref: "#/components/schemas/ToolReviewApproval"
+        batch_calls:
+          type: boolean
+          description: Review request strategy snapshotted for this response. Historical absence means unknown and must not be defaulted to false or the current setting.
+    ToolReviewApproval:
+      type: object
+      additionalProperties: false
+      required: [id, state, review_status, requested_at, expires_at]
+      description: Permission for one batch, independent of model verdict and delivery. While awaiting permission or saving an approved pre-delivery snapshot, the parent summary stays pending; review_status preserves the original review. A pending permission becomes interrupted on restart; a saved decision is preserved even if delivery is unknown.
+      properties:
+        id:
+          type: string
+          pattern: "^[a-zA-Z0-9_-]{1,128}$"
+        state:
+          type: string
+          enum: [pending, approved, denied, expired, cancelled, interrupted]
+        review_status:
+          type: string
+          enum: [flagged, failed]
+        requested_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+        decided_at:
+          type: string
+          format: date-time
+      allOf:
+        - if:
+            properties:
+              state:
+                const: pending
+          then:
+            not:
+              required: [decided_at]
+          else:
+            required: [decided_at]
+    ToolReviewApprovalRequest:
+      type: object
+      additionalProperties: false
+      required: [id, request_id, requested_at, expires_at, summary]
+      properties:
+        id:
+          $ref: "#/components/schemas/ToolReviewApproval/properties/id"
+        request_id:
+          type: string
+        requested_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+        summary:
+          $ref: "#/components/schemas/ToolReviewSummary"
+    ToolReviewApprovalDetail:
+      type: object
+      additionalProperties: false
+      required: [id, request_id, user_request, calls]
+      description: Operator-only ephemeral raw content, never stored in request records or emitted in notifications. Requires an active raw-content unlock session.
+      properties:
+        id:
+          $ref: "#/components/schemas/ToolReviewApproval/properties/id"
+        request_id:
+          type: string
+        user_request:
+          type: string
+        calls:
+          type: array
+          minItems: 1
+          maxItems: 64
+          items:
+            type: object
+            additionalProperties: false
+            required: [index, name, arguments]
+            properties:
+              index:
+                type: integer
+                minimum: 0
+              name:
+                type: string
+                maxLength: 256
+              arguments:
+                type: string
     RequestRecord:
       type: object
       required:

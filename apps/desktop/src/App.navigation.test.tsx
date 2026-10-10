@@ -9,8 +9,29 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+const navigationHost = vi.hoisted(() => ({
+  native: false,
+  listeners: new Map<string, (event: { payload: unknown }) => void>(),
+}));
+vi.mock("@tauri-apps/api/core", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@tauri-apps/api/core")>()),
+  isTauri: () => navigationHost.native,
+}));
+vi.mock("@tauri-apps/api/event", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@tauri-apps/api/event")>()),
+  listen: async (
+    name: string,
+    listener: (event: { payload: unknown }) => void,
+  ) => {
+    navigationHost.listeners.set(name, listener);
+    return () => navigationHost.listeners.delete(name);
+  },
+}));
+
 const bridgeMocks = vi.hoisted(() => ({
   builtinToolAction: vi.fn().mockResolvedValue({ configured: false }),
+  listenProviderImport: vi.fn(async () => () => {}),
+  getPendingProviderImport: vi.fn().mockResolvedValue(null),
   cancelPrivacyModelInstallation: vi.fn(),
   createAccessToken: vi.fn(),
   decideRawAccess: vi.fn(),
@@ -120,6 +141,10 @@ import { defaultFailurePolicy } from "./failure-policy-model";
 import { defaultPrivacyKindRules } from "./privacy-policy-model";
 import { ONBOARDING_STORAGE_KEY } from "./use-onboarding";
 import { settleClosedLayer } from "./lib/test-layer-settle";
+import {
+  TOOL_REVIEW_NAVIGATE_EVENT,
+  type ToolReviewJump,
+} from "./tool-review-navigation";
 
 const readySnapshot: AppSnapshot = {
   app_version: "0.1.0",
@@ -301,6 +326,8 @@ describe("App workspace navigation", () => {
   let root: Root;
 
   beforeEach(() => {
+    navigationHost.native = false;
+    navigationHost.listeners.clear();
     updateMocks.get.mockReset().mockResolvedValue(browserUpdateSnapshot());
     updateMocks.listen.mockReset().mockResolvedValue(() => {});
     updateMocks.info.mockReset();
@@ -536,6 +563,76 @@ describe("App workspace navigation", () => {
       await Promise.resolve();
     });
   }
+
+  const toolJump: ToolReviewJump = {
+    version: 1,
+    target: "main",
+    sessionId: "session_review",
+    requestId: "req_review",
+    reviewIndex: 1,
+    nonce: "jump_1",
+  };
+  async function receiveJump(payload: unknown) {
+    await act(async () => {
+      if (navigationHost.native)
+        navigationHost.listeners.get(TOOL_REVIEW_NAVIGATE_EVENT)!({ payload });
+      else
+        window.dispatchEvent(
+          new CustomEvent(TOOL_REVIEW_NAVIGATE_EVENT, { detail: payload }),
+        );
+    });
+  }
+
+  it.each([false, true])(
+    "routes tool jumps globally with native=%s and rejects extra body fields",
+    async (native) => {
+      navigationHost.native = native;
+      bridgeMocks.getRequestSession.mockImplementation(
+        () => new Promise(() => {}),
+      );
+      await renderApp();
+      await receiveJump({ ...toolJump, body: "must not cross windows" });
+      expect(workspaceHeading().textContent).toBe("运行概览");
+      expect(bridgeMocks.getRequestSession).not.toHaveBeenCalled();
+      await receiveJump(toolJump);
+      expect(workspaceHeading().textContent).toBe("请求记录");
+      expect(bridgeMocks.getRequestSession).toHaveBeenCalledWith(
+        toolJump.sessionId,
+      );
+    },
+  );
+
+  it.each([false, true])(
+    "keeps unsaved-editor protection for tool jumps with native=%s",
+    async (native) => {
+      navigationHost.native = native;
+      bridgeMocks.getRequestSession.mockImplementation(
+        () => new Promise(() => {}),
+      );
+      await renderApp();
+      await act(async () => button("提供商").click());
+      await act(async () => button("添加 API 提供商").click());
+      await chooseKindCard("Codex 订阅");
+      await setInput("#service-name", "Unfinished service");
+      await receiveJump(toolJump);
+      expect(document.querySelector('[role="alertdialog"]')).not.toBeNull();
+      expect(bridgeMocks.getRequestSession).not.toHaveBeenCalled();
+      await act(async () => button("继续编辑").click());
+      await settleClosedLayer();
+      expect(workspaceHeading().textContent).toBe("添加 API 提供商");
+      await receiveJump({
+        ...toolJump,
+        nonce: "jump_2",
+        sessionId: "session_newest",
+      });
+      await act(async () => button("放弃修改并离开").click());
+      await settleClosedLayer();
+      expect(workspaceHeading().textContent).toBe("请求记录");
+      expect(bridgeMocks.getRequestSession).toHaveBeenCalledExactlyOnceWith(
+        "session_newest",
+      );
+    },
+  );
 
   it("opens About independently of gateway readiness and settings", async () => {
     await renderApp();

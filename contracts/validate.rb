@@ -331,6 +331,8 @@ operator_reads = %w[
   /control/v1/services/{service_id}/authorization
   /control/v1/builtin-tools/{kind}/credential
   /control/v1/audit/raw-access
+  /control/v1/tool-review/approvals
+  /control/v1/tool-review/approvals/{approval_id}
   /control/v1/network-addresses
 ]
 # An agent may ask for raw access and give up its own grant; only the
@@ -393,6 +395,82 @@ raise "access-token list must reserve a null cursor" unless access_token_list.fe
 access_token_secret = openapi.dig("components", "schemas", "AccessTokenSecret")
 raise "create access-token response shape drifted" unless access_token_secret.fetch("required") == %w[token access_token] &&
                                                          access_token_secret.dig("properties", "token", "$ref") == "#/components/schemas/AccessToken"
+
+tool_review_schemas = openapi.dig("components", "schemas")
+%w[ToolReviewSettings ToolReviewSettingsSummary ToolReviewSettingsPatch ToolReviewSummary].each do |name|
+  definition = tool_review_schemas.fetch(name)
+  threshold = definition.fetch("properties").fetch("reject_threshold")
+  if threshold.key?("$ref")
+    threshold = resolve_pointer(openapi, threshold.fetch("$ref").delete_prefix("#"), name)
+  end
+  raise "#{name} threshold must be a number in [0, 1]" unless threshold.values_at("type", "minimum", "maximum") == ["number", 0, 1]
+  settings_response = %w[ToolReviewSettings ToolReviewSettingsSummary].include?(name)
+  raise "#{name} threshold requiredness drifted" unless definition.fetch("required", []).include?("reject_threshold") == settings_response
+  if settings_response
+    raise "#{name} threshold default drifted" unless threshold.fetch("default") == 0.5
+  else
+    raise "#{name} must not default omitted thresholds" if threshold.key?("default")
+  end
+end
+
+raise "tool review modes drifted" unless tool_review_schemas.dig("ToolReviewMode", "enum") == %w[mark reject ask]
+raise "tool review backends drifted" unless tool_review_schemas.dig("ToolReviewBackend", "enum") == %w[jev responses]
+%w[ToolReviewSettings ToolReviewSettingsSummary].each do |name|
+  raise "#{name} backend must default to Jev" unless tool_review_schemas.dig(name, "properties", "backend", "default") == "jev"
+end
+review_summary = tool_review_schemas.fetch("ToolReviewSummary")
+raise "historical backend must remain unknown" if review_summary.fetch("required").include?("backend") || review_summary.dig("properties", "backend").key?("default")
+%w[ToolReviewSettings ToolReviewSettingsSummary ToolReviewSettingsPatch].each do |name|
+  definition = tool_review_schemas.fetch(name)
+  %w[ask_on_review_error approval_timeout_ms batch_calls backend].each do |field|
+    raise "#{name} approval setting missing: #{field}" unless definition.fetch("properties").key?(field)
+    required = name != "ToolReviewSettingsPatch"
+    raise "#{name} #{field} requiredness drifted" unless definition.fetch("required", []).include?(field) == required
+  end
+end
+%w[/control/v1/tool-review/approvals /control/v1/tool-review/approvals/{approval_id} /control/v1/tool-review/approvals/{approval_id}/decision].each do |path|
+  item = openapi.fetch("paths").fetch(path)
+  operation = item.fetch(path.end_with?("/decision") ? "post" : "get")
+  raise "tool review approval must be operator-only: #{path}" unless operation.fetch("x-astrlink-role") == "operator"
+end
+approval = tool_review_schemas.fetch("ToolReviewApproval")
+raise "tool review approval states drifted" unless approval.dig("properties", "state", "enum") == %w[pending approved denied expired cancelled interrupted]
+raise "approval metadata exposes raw content" unless (approval.fetch("properties").keys & %w[user_request arguments calls]).empty?
+raise "tool review approval must remain optional for historical records" if tool_review_schemas.fetch("ToolReviewSummary").fetch("required").include?("approval")
+
+tool_review_call = tool_review_schemas.fetch("ToolReviewCall")
+raise "tool review effective verdict values drifted" unless tool_review_call.dig("properties", "verdict", "enum") == %w[pass flag error]
+raise "tool review model verdict values drifted" unless tool_review_call.dig("properties", "model_verdict", "enum") == %w[pass flag]
+raise "tool review reason codes drifted" unless tool_review_call.dig("properties", "reason_code", "enum") == %w[
+  authorized unclear_authorization unauthorized_action destructive_action data_exfiltration
+  privilege_escalation untrusted_execution prompt_injection unrelated_action policy_violation
+]
+raise "tool review delivery actions drifted" unless tool_review_call.dig("properties", "action", "enum") == %w[delivered withheld pending]
+raise "historical tool calls must allow missing model verdict and reason" unless (tool_review_call.fetch("required") & %w[model_verdict reason_code]).empty?
+raise "tool review reason must not expose free text" if tool_review_call.fetch("properties").key?("reason")
+
+request_parameters = openapi.dig("paths", "/control/v1/requests", "get", "parameters")
+review_only_parameters = request_parameters.select { |parameter| parameter["name"] == "tool_review_only" }
+raise "request review-only filter must occur once" unless review_only_parameters.length == 1
+review_only = review_only_parameters.first
+raise "request review-only filter must be an optional strict string boolean" unless review_only.fetch("in") == "query" &&
+                                                                                   review_only.fetch("required", false) == false &&
+                                                                                   review_only.fetch("schema") == { "type" => "string", "enum" => %w[true false] }
+raise "request review-status filter must remain composable" unless request_parameters.any? { |parameter|
+  parameter["name"] == "tool_review_status" && parameter["in"] == "query" &&
+    parameter.dig("schema", "$ref") == "#/components/schemas/ToolReviewStatus"
+}
+openapi.fetch("paths").each do |path, item|
+  next unless path.start_with?("/control/v1/request-sessions")
+
+  parameters = item.fetch("parameters", []) + item.fetch("get", {}).fetch("parameters", [])
+  parameters.each do |parameter|
+    if parameter.key?("$ref")
+      parameter = resolve_pointer(openapi, parameter.fetch("$ref").delete_prefix("#"), path)
+    end
+    raise "request sessions must not accept tool_review_only" if parameter["name"] == "tool_review_only"
+  end
+end
 
 request_record = openapi.dig("components", "schemas", "RequestRecord")
 raise "request records must reserve local access-token attribution" unless request_record.fetch("required").include?("local_access_token_id") &&

@@ -39,6 +39,7 @@ type collectedCall struct {
 	id, callID, name, kind        string
 	arguments                     strings.Builder
 	hasArguments, fragments, done bool
+	responseItemDone              bool
 }
 
 // Collector is owned by one response reader. It is not safe for concurrent use.
@@ -47,6 +48,7 @@ type Collector struct {
 	protocol                contract.ProtocolID
 	streaming               bool
 	observed                bool
+	responseEmptyFinal      bool
 	expectedCandidates      int
 	started                 time.Time
 	calls                   map[string]*collectedCall

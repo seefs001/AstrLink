@@ -577,11 +577,7 @@ func (writer *usageScanningWriter) Flush() {
 }
 
 func (writer *usageScanningWriter) FlushError() error {
-	if controller, ok := writer.ResponseWriter.(interface{ FlushError() error }); ok {
-		return controller.FlushError()
-	}
-	writer.Flush()
-	return nil
+	return http.NewResponseController(writer.ResponseWriter).Flush()
 }
 
 func (writer *usageScanningWriter) Unwrap() http.ResponseWriter {

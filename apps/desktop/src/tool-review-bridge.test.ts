@@ -32,17 +32,28 @@ describe("tool review IPC", () => {
     invoke.mockResolvedValue({ items: [], next_cursor: null });
     await listRequestRecords({
       tool_review_status: "flagged",
+      tool_review_only: true,
       limit: 50,
       cursor: "next",
     });
     expect(invoke).toHaveBeenLastCalledWith("list_request_records", {
-      query: { tool_review_status: "flagged", limit: 50, cursor: "next" },
+      query: {
+        tool_review_status: "flagged",
+        tool_review_only: true,
+        limit: 50,
+        cursor: "next",
+      },
     });
     await listRequestRecords();
     expect(invoke).toHaveBeenLastCalledWith("list_request_records", {
       query: {},
     });
-    await listRequestSessions({ limit: 50 });
+    const sessionQuery = {
+      limit: 50,
+      tool_review_only: true,
+      tool_review_status: "flagged",
+    };
+    await listRequestSessions(sessionQuery);
     expect(invoke).toHaveBeenLastCalledWith("list_request_sessions", {
       query: { limit: 50 },
     });
@@ -50,18 +61,34 @@ describe("tool review IPC", () => {
   it("reads real native settings and carries If-Match plus acknowledgement on save", async () => {
     Reflect.set(window, "__TAURI_INTERNALS__", {});
     invoke.mockResolvedValue(record);
-    expect(await getToolReviewSettings()).toEqual(record);
+    expect(await getToolReviewSettings()).toEqual({
+      ...record,
+      settings: {
+        ...record.settings,
+        reject_threshold: 0.5,
+        ask_on_review_error: false,
+        approval_timeout_ms: 120000,
+        batch_calls: false,
+        backend: "jev",
+      },
+    });
     expect(invoke).toHaveBeenLastCalledWith("get_tool_review_settings");
     await updateToolReviewSettings(record.etag, {
       enabled: true,
+      backend: "responses",
       api_key: "write-only",
+      batch_calls: true,
+      reject_threshold: 0.75,
       data_transfer_acknowledged: true,
     });
     expect(invoke).toHaveBeenLastCalledWith("update_tool_review_settings", {
       etag: record.etag,
       patch: {
         enabled: true,
+        backend: "responses",
         api_key: "write-only",
+        batch_calls: true,
+        reject_threshold: 0.75,
         data_transfer_acknowledged: true,
       },
     });

@@ -20,6 +20,7 @@ import (
 	"github.com/QuantumNous/astrlink/core/internal/relaykitbridge"
 	"github.com/QuantumNous/astrlink/core/internal/storage"
 	"github.com/QuantumNous/astrlink/core/internal/subscription"
+	"github.com/QuantumNous/astrlink/core/internal/toolreview"
 )
 
 const (
@@ -43,20 +44,21 @@ const (
 )
 
 type Dependencies struct {
-	BuiltinToolTester  BuiltinToolTester
-	PricingStore       PricingStore
-	PricingManager     *pricing.Manager
-	ServiceStore       storage.ServiceStore
-	AccessTokenManager AccessTokenManager
-	PolicyStore        storage.PolicyStore
-	PrivacyModels      PrivacyModelRegistry
-	PrivacyFilter      privacy.Filter
-	PolicyChanged      func(contract.Policy)
-	RequestRecords     storage.RequestRecordStore
-	AuditSettings      storage.AuditSettingsStore
-	ToolReviewSettings storage.ToolReviewSettingsStore
-	AuditKeys          storage.AuditKeyStore
-	AuditBlobs         storage.AuditBlobStore
+	BuiltinToolTester   BuiltinToolTester
+	PricingStore        PricingStore
+	PricingManager      *pricing.Manager
+	ServiceStore        storage.ServiceStore
+	AccessTokenManager  AccessTokenManager
+	PolicyStore         storage.PolicyStore
+	PrivacyModels       PrivacyModelRegistry
+	PrivacyFilter       privacy.Filter
+	PolicyChanged       func(contract.Policy)
+	RequestRecords      storage.RequestRecordStore
+	AuditSettings       storage.AuditSettingsStore
+	ToolReviewSettings  storage.ToolReviewSettingsStore
+	ToolReviewApprovals *toolreview.Broker
+	AuditKeys           storage.AuditKeyStore
+	AuditBlobs          storage.AuditBlobStore
 	// RawVault guards raw audit parts. Nil until raw sealing is set up
 	// by the runtime; see RawVault.
 	RawVault RawVault
@@ -118,43 +120,44 @@ type PrivacyModelRegistry interface {
 }
 
 type Handler struct {
-	builtinToolTester  BuiltinToolTester
-	pricingStore       PricingStore
-	pricingManager     *pricing.Manager
-	routingSettings    storage.RoutingSettingsStore
-	routingSettingsMu  sync.Mutex
-	version            contract.VersionResponse
-	capabilities       contract.CapabilitiesResponse
-	serviceStore       storage.ServiceStore
-	accessTokens       AccessTokenManager
-	policyStore        storage.PolicyStore
-	privacyModels      PrivacyModelRegistry
-	privacyFilter      privacy.Filter
-	policyChanged      func(contract.Policy)
-	requestRecords     storage.RequestRecordStore
-	auditSettings      storage.AuditSettingsStore
-	toolReviewSettings storage.ToolReviewSettingsStore
-	auditKeys          storage.AuditKeyStore
-	auditBlobs         storage.AuditBlobStore
-	rawVault           RawVault
-	rawGrants          *rawGrantManager
-	localData          storage.LocalDataStore
-	clientIdentities   ClientIdentityReporter
-	subscriptions      *subscription.Manager
-	rateLimits         RateLimitReleaser
-	codingPlans        CodingPlanUsage
-	serviceModels      ServiceModelProber
-	serviceTester      ServiceTester
-	autoClassifiers    AutoClassifierRegistry
-	autoClassifier     AutoClassifier
-	controlToken       []byte
-	observerToken      []byte
-	newServiceID       func() (contract.ServiceID, error)
-	mux                *http.ServeMux
-	privacyMu          sync.Mutex
-	shutdown           context.CancelFunc
-	observers          *observerTracker
-	consoleSessions    ConsoleSessions
+	builtinToolTester   BuiltinToolTester
+	pricingStore        PricingStore
+	pricingManager      *pricing.Manager
+	routingSettings     storage.RoutingSettingsStore
+	routingSettingsMu   sync.Mutex
+	version             contract.VersionResponse
+	capabilities        contract.CapabilitiesResponse
+	serviceStore        storage.ServiceStore
+	accessTokens        AccessTokenManager
+	policyStore         storage.PolicyStore
+	privacyModels       PrivacyModelRegistry
+	privacyFilter       privacy.Filter
+	policyChanged       func(contract.Policy)
+	requestRecords      storage.RequestRecordStore
+	auditSettings       storage.AuditSettingsStore
+	toolReviewSettings  storage.ToolReviewSettingsStore
+	toolReviewApprovals *toolreview.Broker
+	auditKeys           storage.AuditKeyStore
+	auditBlobs          storage.AuditBlobStore
+	rawVault            RawVault
+	rawGrants           *rawGrantManager
+	localData           storage.LocalDataStore
+	clientIdentities    ClientIdentityReporter
+	subscriptions       *subscription.Manager
+	rateLimits          RateLimitReleaser
+	codingPlans         CodingPlanUsage
+	serviceModels       ServiceModelProber
+	serviceTester       ServiceTester
+	autoClassifiers     AutoClassifierRegistry
+	autoClassifier      AutoClassifier
+	controlToken        []byte
+	observerToken       []byte
+	newServiceID        func() (contract.ServiceID, error)
+	mux                 *http.ServeMux
+	privacyMu           sync.Mutex
+	shutdown            context.CancelFunc
+	observers           *observerTracker
+	consoleSessions     ConsoleSessions
 }
 
 func New(version contract.VersionResponse) *Handler {
@@ -193,37 +196,38 @@ func newHandler(version contract.VersionResponse, dependencies Dependencies) (*H
 		builtinToolTester: dependencies.BuiltinToolTester,
 		clientIdentities:  dependencies.ClientIdentities,
 		pricingStore:      dependencies.PricingStore, pricingManager: dependencies.PricingManager,
-		routingSettings:    routingSettings,
-		version:            version,
-		capabilities:       capabilities,
-		serviceStore:       dependencies.ServiceStore,
-		accessTokens:       dependencies.AccessTokenManager,
-		policyStore:        dependencies.PolicyStore,
-		privacyModels:      dependencies.PrivacyModels,
-		privacyFilter:      dependencies.PrivacyFilter,
-		policyChanged:      dependencies.PolicyChanged,
-		requestRecords:     dependencies.RequestRecords,
-		auditSettings:      dependencies.AuditSettings,
-		toolReviewSettings: dependencies.ToolReviewSettings,
-		auditKeys:          dependencies.AuditKeys,
-		auditBlobs:         dependencies.AuditBlobs,
-		rawVault:           dependencies.RawVault,
-		rawGrants:          newRawGrantManager(),
-		localData:          dependencies.LocalData,
-		subscriptions:      dependencies.Subscriptions,
-		rateLimits:         dependencies.RateLimits,
-		codingPlans:        dependencies.CodingPlans,
-		serviceModels:      dependencies.ServiceModels,
-		serviceTester:      dependencies.ServiceTester,
-		autoClassifiers:    dependencies.AutoClassifiers,
-		autoClassifier:     dependencies.AutoClassifier,
-		controlToken:       []byte(dependencies.ControlToken),
-		observerToken:      []byte(dependencies.ObserverToken),
-		newServiceID:       dependencies.NewServiceID,
-		shutdown:           dependencies.Shutdown,
-		consoleSessions:    dependencies.ConsoleSessions,
-		mux:                http.NewServeMux(),
-		observers:          newObserverTracker(),
+		routingSettings:     routingSettings,
+		version:             version,
+		capabilities:        capabilities,
+		serviceStore:        dependencies.ServiceStore,
+		accessTokens:        dependencies.AccessTokenManager,
+		policyStore:         dependencies.PolicyStore,
+		privacyModels:       dependencies.PrivacyModels,
+		privacyFilter:       dependencies.PrivacyFilter,
+		policyChanged:       dependencies.PolicyChanged,
+		requestRecords:      dependencies.RequestRecords,
+		auditSettings:       dependencies.AuditSettings,
+		toolReviewSettings:  dependencies.ToolReviewSettings,
+		toolReviewApprovals: dependencies.ToolReviewApprovals,
+		auditKeys:           dependencies.AuditKeys,
+		auditBlobs:          dependencies.AuditBlobs,
+		rawVault:            dependencies.RawVault,
+		rawGrants:           newRawGrantManager(),
+		localData:           dependencies.LocalData,
+		subscriptions:       dependencies.Subscriptions,
+		rateLimits:          dependencies.RateLimits,
+		codingPlans:         dependencies.CodingPlans,
+		serviceModels:       dependencies.ServiceModels,
+		serviceTester:       dependencies.ServiceTester,
+		autoClassifiers:     dependencies.AutoClassifiers,
+		autoClassifier:      dependencies.AutoClassifier,
+		controlToken:        []byte(dependencies.ControlToken),
+		observerToken:       []byte(dependencies.ObserverToken),
+		newServiceID:        dependencies.NewServiceID,
+		shutdown:            dependencies.Shutdown,
+		consoleSessions:     dependencies.ConsoleSessions,
+		mux:                 http.NewServeMux(),
+		observers:           newObserverTracker(),
 	}
 	handler.observers.pending = handler.rawGrants.pendingCount
 	handler.observers.active = handler.rawGrants.activeCount
@@ -233,6 +237,8 @@ func newHandler(version contract.VersionResponse, dependencies Dependencies) (*H
 	handler.mux.HandleFunc(BuiltinToolsPath, handler.authenticated(handler.builtinToolResource, RoleOperator))
 	handler.mux.HandleFunc(RoutingSettingsPath, handler.authenticated(handler.routingSettingsResource, RoleObserver))
 	handler.mux.HandleFunc(ToolReviewSettingsPath, handler.authenticated(handler.toolReviewSettingsResource, RoleObserver))
+	handler.mux.HandleFunc(ToolReviewApprovalsPath, handler.authenticated(handler.toolReviewApprovalResource, RoleOperator))
+	handler.mux.HandleFunc(ToolReviewApprovalsPath+"/", handler.authenticated(handler.toolReviewApprovalResource, RoleOperator))
 	handler.mux.HandleFunc(HealthPath, handler.getOnly(func(writer http.ResponseWriter, _ *http.Request) {
 		writeJSON(writer, http.StatusOK, contract.HealthResponse{Status: "ok"})
 	}))

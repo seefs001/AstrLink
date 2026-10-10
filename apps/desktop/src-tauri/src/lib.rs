@@ -24,6 +24,7 @@ mod service_proxy;
 mod sidecar;
 mod startup_window;
 mod tool_review;
+mod tool_review_approval;
 mod tray;
 mod updates;
 
@@ -1023,6 +1024,32 @@ fn close_unpinned_inspectors(app: &tauri::AppHandle) {
     }
 }
 
+/// Return to the main window from a live inspector without granting all
+/// webviews generic show/focus capabilities. The caller sends its navigation
+/// event after this resolves: navigation may close an unpinned inspector.
+#[tauri::command]
+fn focus_main_window(
+    app: tauri::AppHandle,
+    window: tauri::Window,
+    registry: State<'_, Mutex<InspectorRegistry>>,
+) -> Result<(), String> {
+    if !window
+        .label()
+        .starts_with(TRAJECTORY_INSPECTOR_LABEL_PREFIX)
+        || inspector_registry(&registry)?
+            .state(window.label())
+            .selection
+            .is_none()
+    {
+        return Err("only an active trajectory inspector may focus the main window".to_string());
+    }
+    if app.get_webview_window("main").is_none() {
+        return Err("the main window is unavailable".to_string());
+    }
+    show_main_window(&app);
+    Ok(())
+}
+
 #[tauri::command]
 fn close_trajectory_inspectors(app: tauri::AppHandle) {
     close_unpinned_inspectors(&app);
@@ -1641,6 +1668,37 @@ async fn builtin_tool_action(
 }
 
 #[tauri::command]
+async fn list_tool_review_approvals(
+    manager: State<'_, Arc<CoreManager>>,
+) -> Result<tool_review_approval::PendingList, String> {
+    manager.list_tool_review_approvals().await
+}
+
+#[tauri::command]
+async fn get_tool_review_approval(
+    approval_id: String,
+    manager: State<'_, Arc<CoreManager>>,
+) -> Result<tool_review_approval::Detail, String> {
+    manager.get_tool_review_approval(&approval_id).await
+}
+
+#[tauri::command]
+async fn decide_tool_review_approval(
+    approval_id: String,
+    decision: String,
+    manager: State<'_, Arc<CoreManager>>,
+) -> Result<tool_review_approval::Approval, String> {
+    manager
+        .decide_tool_review_approval(&approval_id, &decision)
+        .await
+}
+
+#[tauri::command]
+fn open_tool_review_approval_window(app: tauri::AppHandle) -> Result<(), String> {
+    tool_review_approval::open(&app, true)
+}
+
+#[tauri::command]
 async fn get_tool_review_settings(
     manager: State<'_, Arc<CoreManager>>,
 ) -> Result<serde_json::Value, String> {
@@ -2081,6 +2139,7 @@ pub fn run() {
         .manage(explicit_quit)
         .manage(Mutex::new(InspectorRegistry::default()))
         .manage(tray::TrayState::default())
+        .manage(tool_review_approval::WindowState::default())
         .manage(Arc::new(client_updates::ClientUpdateManager::default()))
         .manage(Arc::new(model_updates::PrivacyModelUpdates::default()))
         .manage(provider_import::ProviderImports::default())
@@ -2156,6 +2215,10 @@ pub fn run() {
             update_routing_settings,
             get_tool_review_settings,
             update_tool_review_settings,
+            list_tool_review_approvals,
+            get_tool_review_approval,
+            decide_tool_review_approval,
+            open_tool_review_approval_window,
             get_client_identities,
             get_audit_settings,
             update_audit_settings,
@@ -2198,6 +2261,7 @@ pub fn run() {
             trajectory_inspector_state,
             set_trajectory_inspector_pinned,
             set_trajectory_inspector_wide,
+            focus_main_window,
             close_trajectory_inspectors
         ])
         .setup(move |app| {
@@ -2252,6 +2316,7 @@ pub fn run() {
 
             tray::build(app.handle())?;
             tray::start(app.handle());
+            tool_review_approval::start(app.handle());
             model_updates::start(app.handle());
 
             let deep_link = app.deep_link();
@@ -2400,6 +2465,7 @@ pub fn run() {
             }
         }
         if matches!(event, RunEvent::Exit | RunEvent::ExitRequested { .. }) {
+            tool_review_approval::stop(app_handle);
             if let Some(manager) = app_handle.try_state::<Arc<CoreManager>>() {
                 let manager = Arc::clone(manager.inner());
                 if let Err(error) = tauri::async_runtime::block_on(manager.stop_and_wait()) {

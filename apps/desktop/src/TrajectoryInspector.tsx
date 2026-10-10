@@ -1,10 +1,11 @@
 import { RecoveryDetails } from "./components/RecoveryDetails";
 import { ToolReviewDetails } from "./ToolReviewDetails";
+import { hasVisibleToolReview } from "./tool-review-record-model";
 import { ConversionDiagnosticsDetails } from "./components/ConversionDiagnosticsDetails";
 import { RoutingSteps } from "./components/RoutingSteps";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 
-import { LockKeyhole } from "@/components/icons";
+import { LockKeyhole, ShieldCheck } from "@/components/icons";
 import { Button } from "@/components/ui/button";
 import { ConversationIndicator } from "@/components/ConversationIndicator";
 import { ModelLabel } from "@/components/ModelLabel";
@@ -99,7 +100,27 @@ export function TrajectoryInspector({
   const chain = useMemo(() => inspectorChainRows(record), [record]);
   const tabs = useMemo(() => inspectorTabs(chain), [chain]);
   const requestedTab = tabChip(row.chip);
-  const [focusChip, setFocusChip] = useState(requestedTab);
+  const [focusChip, setFocusChip] = useState<TrajectoryChip | "TOOL_REVIEW">(
+    requestedTab,
+  );
+  const panelId = useId();
+  const review = hasVisibleToolReview(record.tool_review)
+    ? record.tool_review
+    : null;
+  const hasReview = review !== null;
+  const reviewSelected = hasReview && focusChip === "TOOL_REVIEW";
+  const navigation = hasReview
+    ? [
+        ...tabs,
+        { id: `${record.id}:tool-review`, chip: "TOOL_REVIEW" as const },
+      ]
+    : tabs;
+  useEffect(() => {
+    if (!hasReview)
+      setFocusChip((current) =>
+        current === "TOOL_REVIEW" ? requestedTab : current,
+      );
+  }, [hasReview, requestedTab]);
   const tabsRef = useRef(tabs);
   tabsRef.current = tabs;
   // Only a different phase moves the tab. A poll hands down a fresh record for
@@ -118,6 +139,7 @@ export function TrajectoryInspector({
     tabs.find((item) => item.chip === requestedTab) ??
     tabs[0] ??
     null;
+  const activeChip = reviewSelected ? "TOOL_REVIEW" : focusRow?.chip;
   const routes = useMemo(
     () => chain.filter((item) => item.chip === "ROUTE"),
     [chain],
@@ -139,12 +161,12 @@ export function TrajectoryInspector({
       data-testid="trajectory-inspector"
     >
       <header className="flex shrink-0 items-center justify-between gap-2 border-b px-3 py-2">
-        <div className="flex min-w-0 flex-1 flex-wrap items-center gap-x-3 gap-y-1">
+        <div className="flex min-w-0 flex-1 items-center gap-3">
           <RequestServiceLabel
-            className="text-xs font-medium"
+            className="max-w-[50%] text-xs font-medium"
             service={service}
           />
-          <span className="flex min-w-0 max-w-full items-center gap-1.5">
+          <span className="flex min-w-0 flex-1 items-center gap-1.5">
             <strong
               className="min-w-0 truncate text-xs font-medium"
               title={title}
@@ -192,12 +214,14 @@ export function TrajectoryInspector({
         data-testid="inspector-tabs"
         role="tablist"
       >
-        {tabs.map((item) => {
-          const selected = item.chip === focusChip;
+        {navigation.map((item) => {
+          const selected = item.chip === activeChip;
           return (
             <Button
               variant="ghost"
               aria-selected={selected}
+              id={`${panelId}-${item.chip}`}
+              aria-controls={panelId}
               className={cn(
                 "relative h-9 shrink-0 gap-1.5 rounded-none px-0 text-xs font-medium text-foreground/60 hover:bg-transparent hover:text-foreground",
                 "after:absolute after:inset-x-0 after:bottom-0 after:h-0.5 after:rounded-full after:bg-foreground after:opacity-0 after:transition-opacity",
@@ -210,19 +234,27 @@ export function TrajectoryInspector({
               role="tab"
               type="button"
             >
-              <span
-                aria-hidden="true"
-                className={cn(
-                  "size-1.5 shrink-0 rounded-full",
-                  chipDotClass(item.chip, item.tone),
-                )}
-              />
-              {t(`trajectory.chips.${item.chip}`)}
+              {item.chip === "TOOL_REVIEW" ? (
+                <ShieldCheck aria-hidden="true" className="size-3.5" />
+              ) : (
+                <span
+                  aria-hidden="true"
+                  className={cn(
+                    "size-1.5 shrink-0 rounded-full",
+                    chipDotClass(item.chip, item.tone),
+                  )}
+                />
+              )}
+              {t(
+                item.chip === "TOOL_REVIEW"
+                  ? "toolReview.title"
+                  : `trajectory.chips.${item.chip}`,
+              )}
             </Button>
           );
         })}
       </div>
-      {auditError ? (
+      {!reviewSelected && auditError ? (
         <p
           className="shrink-0 px-3 pt-2 text-xs text-danger-foreground"
           role="alert"
@@ -230,7 +262,7 @@ export function TrajectoryInspector({
           {auditError}
         </p>
       ) : null}
-      {auditLoading ? (
+      {!reviewSelected && auditLoading ? (
         <p
           className="shrink-0 px-3 pt-2 text-xs text-muted-foreground"
           role="status"
@@ -241,14 +273,21 @@ export function TrajectoryInspector({
       <div
         className={cn(
           "min-h-0 flex-1 p-3",
-          focusRow && ownsScroller(focusRow.chip) && "flex flex-col",
+          !reviewSelected &&
+            focusRow &&
+            ownsScroller(focusRow.chip) &&
+            "flex flex-col",
           "overflow-y-auto overscroll-contain",
         )}
+        id={panelId}
+        role="tabpanel"
+        aria-labelledby={activeChip ? `${panelId}-${activeChip}` : undefined}
+        data-tab-scroller
+        data-testid="trajectory-inspector-primary"
       >
-        {record.tool_review ? (
-          <ToolReviewDetails summary={record.tool_review} />
-        ) : null}
-        {focusRow ? (
+        {reviewSelected && review ? (
+          <ToolReviewDetails summary={review} record={record} embedded />
+        ) : focusRow ? (
           <InspectorFindShortcut.Provider value={findShortcut}>
             <InspectorSection
               key={`${record.id}:${focusRow.chip}`}

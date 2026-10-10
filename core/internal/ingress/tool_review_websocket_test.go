@@ -38,7 +38,7 @@ func (client *reviewWSClient) WriteMessage(_ int, data []byte) error {
 
 func TestToolReviewWebSocketPartialPublication(t *testing.T) {
 	for _, mode := range []contract.ToolReviewMode{contract.ToolReviewModeReject, contract.ToolReviewModeMark} {
-		for _, scenario := range []string{"partial write", "cancel replay", "terminal write", "pass", "terminal disconnect", "no tools terminal write"} {
+		for _, scenario := range []string{"partial write", "cancel replay", "terminal write", "pass", "terminal disconnect", "no tools terminal write", "no tools pass", "no tools terminal disconnect"} {
 			t.Run(string(mode)+"/"+scenario, func(t *testing.T) {
 				ctx, cancel := context.WithCancel(context.Background())
 				defer cancel()
@@ -60,6 +60,11 @@ func TestToolReviewWebSocketPartialPublication(t *testing.T) {
 					client.cancelAt = 9
 				case "no tools terminal write":
 					client.failAt = 0
+				case "no tools terminal disconnect":
+					client.cancelAt = 1
+				}
+				noTools := strings.HasPrefix(scenario, "no tools")
+				if noTools {
 					events = []string{`{"type":"response.completed","response":{"id":"resp_review","status":"completed","output":[]}}`}
 				}
 				provider := wsUpstream(t, func(conn *websocket.Conn, _ *http.Request) {
@@ -73,7 +78,12 @@ func TestToolReviewWebSocketPartialPublication(t *testing.T) {
 						}
 					}
 				})
-				judge := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { sendReviewChoice(w, "pass") }))
+				judge := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+					if noTools {
+						t.Error("no-tool WebSocket response reached judge")
+					}
+					sendReviewChoice(w, "pass")
+				}))
 				defer judge.Close()
 				settings := contract.DefaultToolReviewSettings()
 				settings.Enabled, settings.CredentialConfigured, settings.Mode, settings.Endpoint = true, true, mode, judge.URL
@@ -88,8 +98,8 @@ func TestToolReviewWebSocketPartialPublication(t *testing.T) {
 				handler.ServeHTTP(writer, request)
 				writer.finish()
 				record := records.latest(t)
-				success := scenario == "pass" || scenario == "terminal disconnect"
-				if mode == contract.ToolReviewModeMark && success {
+				success := scenario == "pass" || scenario == "terminal disconnect" || scenario == "no tools pass" || scenario == "no tools terminal disconnect"
+				if mode == contract.ToolReviewModeMark && success && !noTools {
 					select {
 					case record = <-records.updated:
 					case <-time.After(2 * time.Second):
@@ -103,16 +113,25 @@ func TestToolReviewWebSocketPartialPublication(t *testing.T) {
 				if success {
 					want = contract.RequestStatusSucceeded
 				}
-				if record.Status != want || record.ToolReview == nil || (mode == contract.ToolReviewModeReject && scenario != "no tools terminal write" && len(record.ToolReview.Calls) != 2) {
+				if record.Status != want {
 					t.Fatalf("record status=%s review=%+v messages=%d", record.Status, record.ToolReview, len(client.messages))
 				}
-				wantAction := "pending"
-				if success {
-					wantAction = "delivered"
-				}
-				for _, call := range record.ToolReview.Calls {
-					if call.Action != wantAction {
-						t.Errorf("partial WS delivery falsely classified: %+v", call)
+				if noTools && success {
+					if record.ToolReview != nil {
+						t.Fatalf("no-tool WebSocket response created review: %+v", record.ToolReview)
+					}
+				} else {
+					if record.ToolReview == nil || (mode == contract.ToolReviewModeReject && !noTools && len(record.ToolReview.Calls) != 2) {
+						t.Fatalf("missing review metadata: %+v", record.ToolReview)
+					}
+					wantAction := "pending"
+					if success {
+						wantAction = "delivered"
+					}
+					for _, call := range record.ToolReview.Calls {
+						if call.Action != wantAction {
+							t.Errorf("partial WS delivery falsely classified: %+v", call)
+						}
 					}
 				}
 				terminals := 0

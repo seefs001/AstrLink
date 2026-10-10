@@ -173,6 +173,14 @@ func TestToolReviewMarkDoesNotWaitForJudgeAndPreservesSuccessfulRecord(t *testin
 	case <-time.After(2 * time.Second):
 		t.Fatal("review did not start")
 	}
+	pending := records.latest(t).ToolReview
+	if pending == nil || pending.Status != "pending" || pending.RejectThreshold == nil || *pending.RejectThreshold != 0.5 || len(pending.Calls) != 1 || pending.Calls[0].Name != "bash" || pending.Calls[0].Action != "delivered" || pending.CompletedAt != nil {
+		t.Fatalf("admitted mark job missing safe metadata: %+v", pending)
+	}
+	encoded, err := json.Marshal(pending)
+	if err != nil || strings.Contains(string(encoded), "remove-important-data") {
+		t.Fatalf("pending arguments leaked: %s %v", encoded, err)
+	}
 	releaseOnce.Do(func() { close(release) })
 	select {
 	case record := <-records.updated:

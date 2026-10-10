@@ -73,6 +73,11 @@ import { ProviderImportDialog } from "./ProviderImportDialog";
 import { useProviderImport } from "./use-provider-import";
 import { notify } from "./notify";
 import type { Service } from "./service-model";
+import {
+  TOOL_REVIEW_NAVIGATE_EVENT,
+  parseToolReviewJump,
+  type ToolReviewJump,
+} from "./tool-review-navigation";
 import { TRAY_NAVIGATE_EVENT } from "./tray-popover-window";
 import {
   DEFAULT_USAGE_RANGE_PRESET,
@@ -85,7 +90,7 @@ type WorkspacePage =
   | { kind: "overview" }
   | { kind: "tokens" }
   | { kind: "safety"; view?: "models" }
-  | { kind: "records"; tokenId?: string }
+  | { kind: "records"; tokenId?: string; toolJump?: ToolReviewJump }
   | { kind: "routing" }
   | { kind: "agentTools"; preselectSkill?: AgentSkillId }
   | { kind: "settings" }
@@ -659,6 +664,36 @@ export default function App() {
     };
   }, []);
 
+  useEffect(() => {
+    let cancelled = false;
+    let stop: UnlistenFn | null = null;
+    const receive = (payload: unknown) => {
+      const toolJump = parseToolReviewJump(payload);
+      if (!cancelled && toolJump)
+        navigateRef.current({ kind: "records", toolJump });
+    };
+    // Docked browser inspectors use the same global navigation guard as native
+    // messages. RequestRecords must not also consume this event directly.
+    const receiveDOM = (event: Event) =>
+      receive((event as CustomEvent<unknown>).detail);
+    window.addEventListener(TOOL_REVIEW_NAVIGATE_EVENT, receiveDOM);
+    if (isTauri()) {
+      void listen<unknown>(TOOL_REVIEW_NAVIGATE_EVENT, ({ payload }) =>
+        receive(payload),
+      )
+        .then((unlisten) => {
+          if (cancelled) unlisten();
+          else stop = unlisten;
+        })
+        .catch(() => notify.error(i18n.t("toolReview.location.unreliable")));
+    }
+    return () => {
+      cancelled = true;
+      stop?.();
+      window.removeEventListener(TOOL_REVIEW_NAVIGATE_EVENT, receiveDOM);
+    };
+  }, []);
+
   const updateNoticeKind = updateNotice(updates.snapshot);
   useEffect(() => {
     const version = updates.snapshot.release?.version;
@@ -1047,6 +1082,7 @@ export default function App() {
                 accessTokensReady={tokenCatalog.status === "ready"}
                 coreSessionKey={coreSessionKey}
                 initialLocalAccessTokenId={page.tokenId}
+                toolJump={page.toolJump}
                 services={catalog.items}
                 isReady={isReady}
               />

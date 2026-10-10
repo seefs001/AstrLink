@@ -7,6 +7,10 @@ export interface ResponseOutput {
   name?: string;
   /** The provider's call id on a tool output, so a later request can answer it. */
   id?: string;
+  /** Ephemeral parser slot, requested only by the conversation locator. */
+  sourceKey?: string;
+  /** Set only after verification against the client capture and review metadata. */
+  reviewIndex?: number;
 }
 
 export interface ResponsePreview {
@@ -35,9 +39,11 @@ const detail = (value: unknown): string =>
 export async function parseResponsePreview(
   part: AuditContentPart,
   signal?: AbortSignal,
+  includeSourceKeys = false,
 ): Promise<ResponsePreview> {
   const outputs = new Map<string, ResponseOutput>();
   const itemIndexes = new Map<string, string>();
+  const geminiOccurrences = new Map<string, number>();
   let incomplete = part.truncated;
   let unparsed = false;
   const put = (
@@ -245,12 +251,12 @@ export async function parseResponsePreview(
           tools.push({ function: message.function_call });
         tools.forEach((value, j) => {
           const tool = object(value);
-          const fn = object(tool.function);
+          const fn = object(tool.function ?? tool.custom);
           const toolKey = `${key}:tool:${tool.index ?? j}`;
           put(
             toolKey,
             "tool",
-            string(fn.arguments),
+            string(fn.arguments ?? fn.input),
             delta,
             delta
               ? (outputs.get(toolKey)?.name ?? "") + string(fn.name)
@@ -299,8 +305,10 @@ export async function parseResponsePreview(
           put(`${key}:${kind}`, kind, part.text, true);
         } else if (part.functionCall) {
           const call = object(part.functionCall);
+          const occurrence = geminiOccurrences.get(key) ?? 0;
+          geminiOccurrences.set(key, occurrence + 1);
           put(
-            `${key}:tool:${outputs.size}`,
+            `${key}:tool:${occurrence}`,
             "tool",
             detail(call.args),
             false,
@@ -353,7 +361,11 @@ export async function parseResponsePreview(
     }
   }
   return {
-    outputs: [...outputs.values()].filter((item) => item.text || item.name),
+    outputs: [...outputs.entries()]
+      .filter(([, item]) => item.text || item.name)
+      .map(([sourceKey, item]) =>
+        includeSourceKeys ? { ...item, sourceKey } : item,
+      ),
     incomplete,
     unparsed,
   };

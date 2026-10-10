@@ -12,6 +12,7 @@ import {
   Plus,
   RotateCcw,
   ScanText as ScanLine,
+  ShieldCheck,
   SlidersHorizontal,
   type AnimatedIcon,
 } from "@/components/icons";
@@ -2589,7 +2590,10 @@ export function SafetyPolicy({
           <Boxes aria-hidden="true" />
           {t("safety.tabModels")}
         </TabsTrigger>
-        <TabsTrigger value="toolReview">{t("toolReview.title")}</TabsTrigger>
+        <TabsTrigger value="toolReview" data-testid="safety-tool-review-tab">
+          <ShieldCheck aria-hidden="true" />
+          {t("toolReview.title")}
+        </TabsTrigger>
       </TabsList>
       <TabsContent
         value="toolReview"
@@ -2597,7 +2601,11 @@ export function SafetyPolicy({
         forceMount={toolReviewVisited || undefined}
         hidden={workspace !== "toolReview"}
       >
-        <ToolReviewSettings coreSessionKey={coreSessionKey} isReady={isReady} />
+        <ToolReviewSettings
+          coreSessionKey={coreSessionKey}
+          isReady={isReady}
+          active={workspace === "toolReview"}
+        />
       </TabsContent>
     </>
   );
@@ -2655,23 +2663,25 @@ export function SafetyPolicy({
               coreSessionKey={coreSessionKey}
               isReady={isReady}
             />
-            <Button
-              disabled={
-                status === "loading" ||
-                saving ||
-                operationBusy !== null ||
-                probing ||
-                catalogProbeBusy !== null
-              }
-              onClick={refresh}
-              size="sm"
-              variant="outline"
-              type="button"
-            >
-              {status === "loading"
-                ? t("common.refreshing")
-                : t("common.refresh")}
-            </Button>
+            {workspace !== "toolReview" ? (
+              <Button
+                disabled={
+                  status === "loading" ||
+                  saving ||
+                  operationBusy !== null ||
+                  probing ||
+                  catalogProbeBusy !== null
+                }
+                onClick={refresh}
+                size="sm"
+                variant="outline"
+                type="button"
+              >
+                {status === "loading"
+                  ? t("common.refreshing")
+                  : t("common.refresh")}
+              </Button>
+            ) : null}
           </>
         }
         description={t("safety.description")}

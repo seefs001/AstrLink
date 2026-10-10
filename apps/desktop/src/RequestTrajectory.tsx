@@ -124,6 +124,7 @@ export function RequestTrajectory({
   copyFeedback,
   services = NO_SERVICES,
   onUnlockRaw,
+  onDockedInspectorVisibilityChange,
 }: {
   turns: RequestRecord[];
   childrenByRoot: Record<string, RequestRecord[]>;
@@ -136,6 +137,8 @@ export function RequestTrajectory({
   services?: RequestServiceMap;
   /** Opens the raw unlock from the overlay inspector. */
   onUnlockRaw?: () => void;
+  /** Lets the host reclaim auxiliary chrome while the browser inspector is open. */
+  onDockedInspectorVisibilityChange?: (visible: boolean) => void;
 }) {
   const t = useT();
   const serviceByRequest = useMemo(
@@ -265,6 +268,12 @@ export function RequestTrajectory({
     [selectedRecord, selectedRow, serviceByRequest, services],
   );
   const inspectorWindow = useDetachedInspector(selection);
+  const dockedInspectorVisible =
+    selection !== null && !inspectorWindow.enabled && overlayOpen;
+  useEffect(() => {
+    onDockedInspectorVisibilityChange?.(dockedInspectorVisible);
+    return () => onDockedInspectorVisibilityChange?.(false);
+  }, [dockedInspectorVisible, onDockedInspectorVisibilityChange]);
 
   const selectRow = useCallback(
     (row: TrajectoryRow, options?: { reveal?: boolean; inspect?: boolean }) => {
@@ -559,7 +568,10 @@ export function RequestTrajectory({
   }, [sessionKey]);
 
   return (
-    <div className="@container/trajectory flex h-full min-h-0 min-w-0 flex-1 flex-col">
+    <div
+      className="@container/trajectory relative flex h-full min-h-0 min-w-0 flex-1 flex-col overflow-hidden"
+      data-testid="request-trajectory-workspace"
+    >
       <TrajectoryTimelineView
         followSelectionRef={followSelectionOnStripRef}
         onScroll={() => scheduleSync("strip")}
@@ -697,42 +709,41 @@ export function RequestTrajectory({
                 ))}
           </ol>
         </div>
-        {/* Without a window host the pane floats above the list instead of
-            splitting the row, so the list keeps its full width either way. */}
-        {selection && !inspectorWindow.enabled ? (
-          <aside
-            className={cn(
-              "absolute inset-y-0 right-0 z-10 flex min-h-0 w-[min(100%,26rem)] border-l shadow-lg",
-              !overlayOpen && "hidden",
-            )}
-          >
-            <TrajectoryInspector
-              auditContent={
-                auditContent?.request_id === selection.row.requestId
-                  ? auditContent
-                  : null
-              }
-              auditError={
-                selectedRequestId === selection.row.requestId
-                  ? auditError
-                  : null
-              }
-              auditLoading={
-                selectedRequestId === selection.row.requestId &&
-                (auditLoading ||
-                  auditContent?.request_id !== selection.row.requestId)
-              }
-              copyFeedback={copyFeedback}
-              onClose={() => setOverlayOpen(false)}
-              onUnlockRaw={onUnlockRaw}
-              record={selection.record}
-              row={selection.row}
-              service={selection.service}
-              services={selection.services}
-            />
-          </aside>
-        ) : null}
       </div>
+      {/* The browser inspector fills the trajectory height, including the
+            timeline and column header, instead of inheriting only the list height. */}
+      {selection && !inspectorWindow.enabled ? (
+        <aside
+          data-testid="trajectory-inspector-overlay"
+          className={cn(
+            "absolute inset-y-0 right-0 z-10 flex min-h-0 w-[min(100%,26rem)] border-l shadow-lg",
+            !overlayOpen && "hidden",
+          )}
+        >
+          <TrajectoryInspector
+            auditContent={
+              auditContent?.request_id === selection.row.requestId
+                ? auditContent
+                : null
+            }
+            auditError={
+              selectedRequestId === selection.row.requestId ? auditError : null
+            }
+            auditLoading={
+              selectedRequestId === selection.row.requestId &&
+              (auditLoading ||
+                auditContent?.request_id !== selection.row.requestId)
+            }
+            copyFeedback={copyFeedback}
+            onClose={() => setOverlayOpen(false)}
+            onUnlockRaw={onUnlockRaw}
+            record={selection.record}
+            row={selection.row}
+            service={selection.service}
+            services={selection.services}
+          />
+        </aside>
+      ) : null}
     </div>
   );
 }

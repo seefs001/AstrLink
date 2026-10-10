@@ -280,6 +280,48 @@ describe("pairToolCalls", () => {
     ]);
   });
 
+  it("propagates only verified indexes through clipping, pairing and conversation turns", () => {
+    const r = record();
+    const content: AuditContent = {
+      request_id: r.id,
+      view: "shareable",
+      http_meta: null,
+      upstream_http_meta: null,
+      request_body: null,
+      upstream_request_body: null,
+      upstream_response_content: null,
+      response_content: {
+        content: "{}",
+        media_type: "application/json",
+        truncated: false,
+        captured_bytes: 2,
+      },
+      withheld: {},
+      privacy_findings: [],
+    };
+    const call = parseCallContent(r, content, [
+      {
+        kind: "tool",
+        name: "same",
+        text: "x".repeat(30000),
+        id: "second",
+        reviewIndex: 1,
+      },
+      { kind: "tool", name: "same", text: "{}", id: "hosted" },
+      { kind: "tool", name: "same", text: "{}", id: "first", reviewIndex: 0 },
+    ]);
+    expect(call.outputs[0]!.text.length).toBeLessThan(30000);
+    const turn = conversationTurns([r], {}, new Map([[r.id, call]]))[0]!;
+    expect(
+      turn.calls[0]!.toolCalls.map((tool) => [tool.id, tool.reviewIndex]),
+    ).toEqual([
+      ["second", 1],
+      ["hosted", undefined],
+      ["first", 0],
+    ]);
+    expect(turn.calls[0]!.toolCalls[1]).not.toHaveProperty("reviewIndex");
+  });
+
   it("pairs Gemini results by name and order when there is no id", () => {
     expect(
       pairToolCalls(

@@ -423,6 +423,68 @@ describe("client response preview", () => {
     ]);
   });
 
+  it("preserves Chat function/custom name and input deltas without locator-only fields", async () => {
+    for (const kind of ["function", "custom"]) {
+      const field = kind === "custom" ? "input" : "arguments";
+      const result = await preview(
+        [
+          {
+            choices: [
+              {
+                index: 0,
+                delta: {
+                  tool_calls: [
+                    {
+                      index: 0,
+                      type: kind,
+                      id: "call",
+                      [kind]: { name: "look", [field]: "first " },
+                    },
+                  ],
+                },
+              },
+            ],
+          },
+          {
+            choices: [
+              {
+                index: 0,
+                delta: {
+                  tool_calls: [
+                    { index: 0, [kind]: { name: "up", [field]: "second" } },
+                  ],
+                },
+                finish_reason: "tool_calls",
+              },
+            ],
+          },
+        ],
+        true,
+      );
+      expect(result.outputs).toEqual([
+        { kind: "tool", name: "lookup", text: "first second", id: "call" },
+      ]);
+    }
+  });
+
+  it("does not deduplicate Gemini wire occurrences on the normal preview path", async () => {
+    const frame = {
+      candidates: [
+        {
+          content: {
+            parts: [{ functionCall: { id: "call", name: "same", args: {} } }],
+          },
+          finishReason: "STOP",
+        },
+      ],
+    };
+    const result = await preview([frame, frame], true);
+    expect(result.outputs).toEqual([
+      { kind: "tool", name: "same", text: "{}" },
+      { kind: "tool", name: "same", text: "{}" },
+    ]);
+  });
+
   it("reports partial captures and malformed events while keeping valid text", async () => {
     const content =
       'data: {"choices":[{"delta":{"content":"Saved"}}]}\n\ndata: {"broken"';

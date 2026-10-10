@@ -37,7 +37,16 @@ function record(id: string, status = "pending") {
       config_revision: "r1",
       started_at: "2026-10-09T10:00:00Z",
       latency_ms: 10,
-      calls: [],
+      calls: [
+        {
+          index: 0,
+          name: "shell",
+          verdict: status === "pending" ? "error" : "flag",
+          action: "delivered",
+          latency_ms: 10,
+          model: "jev-latest",
+        },
+      ],
     },
   };
 }
@@ -54,7 +63,7 @@ async function click(label: string) {
 }
 async function chooseStatus(label: string) {
   await act(async () =>
-    container.querySelector('[aria-label="审查状态"]')!.dispatchEvent(
+    container.querySelector('[aria-label="审查结果"]')!.dispatchEvent(
       new PointerEvent("pointerdown", {
         bubbles: true,
         button: 0,
@@ -62,6 +71,7 @@ async function chooseStatus(label: string) {
       }),
     ),
   );
+  expect(document.body.textContent).not.toContain("未审查");
   const option = Array.from(
     document.querySelectorAll<HTMLElement>('[role="option"]'),
   ).find((item) => item.textContent === label)!;
@@ -84,6 +94,45 @@ afterEach(async () => {
   Reflect.deleteProperty(window, "__TAURI_INTERNALS__");
 });
 describe("ToolReviewRecords", () => {
+  it("filters historical placeholders without hiding zero-call failures", async () => {
+    invoke.mockResolvedValue({
+      items: [
+        "not_applicable",
+        "pending",
+        "failed",
+        "interrupted",
+        "cancelled",
+      ].map((status) => {
+        const item = record(status, status);
+        item.tool_review.calls = [];
+        return item;
+      }),
+      next_cursor: null,
+    });
+    await act(async () =>
+      root.render(<ToolReviewRecords coreSessionKey="test" isReady />),
+    );
+    const rows = container.querySelectorAll<HTMLButtonElement>(
+      '[data-testid="tool-review-record-row"]',
+    );
+    expect(Array.from(rows, (row) => row.dataset.recordId)).toEqual([
+      "failed",
+      "interrupted",
+      "cancelled",
+    ]);
+    expect(container.textContent).not.toContain("未审查");
+    expect(
+      Array.from(
+        container.querySelectorAll('[data-testid="tool-review-badge"]'),
+        (badge) => badge.textContent,
+      ),
+    ).not.toContain("审查中");
+    await act(async () => rows[0].click());
+    expect(
+      container.querySelector('[data-testid="tool-review-details"]')
+        ?.textContent,
+    ).toContain("审查失败");
+  });
   it("queries review filters on the server and carries them through pagination", async () => {
     invoke.mockImplementation(async (_command, { query }) => ({
       items: [
@@ -97,19 +146,58 @@ describe("ToolReviewRecords", () => {
     await act(async () =>
       root.render(<ToolReviewRecords coreSessionKey="test" isReady />),
     );
-    await chooseStatus("审查命中");
     expect(invoke).toHaveBeenLastCalledWith("list_request_records", {
-      query: { limit: 50, tool_review_status: "flagged" },
+      query: { limit: 50, tool_review_only: true },
     });
-    await click("加载更早请求");
+    await chooseStatus("拒绝（仅记录）");
     expect(invoke).toHaveBeenLastCalledWith("list_request_records", {
-      query: { limit: 50, tool_review_status: "flagged", cursor: "older" },
+      query: {
+        limit: 50,
+        tool_review_only: true,
+        tool_review_status: "flagged",
+      },
+    });
+    await click("加载更早记录");
+    expect(invoke).toHaveBeenLastCalledWith("list_request_records", {
+      query: {
+        limit: 50,
+        tool_review_only: true,
+        tool_review_status: "flagged",
+        cursor: "older",
+      },
     });
     expect(
       container.querySelectorAll('[data-testid="tool-review-record-row"]'),
     ).toHaveLength(2);
-    expect(container.textContent).toContain("完成");
-    expect(container.textContent).toContain("审查命中");
+    expect(container.textContent).not.toContain("完成");
+    expect(container.textContent).toContain("1 个工具调用");
+    expect(container.textContent).toContain("拒绝（仅记录）");
+  });
+  it("returns to the selected row without losing list scroll or keyboard focus", async () => {
+    invoke.mockResolvedValue({
+      items: [record("req_one", "flagged"), record("req_two", "passed")],
+      next_cursor: null,
+    });
+    await act(async () =>
+      root.render(<ToolReviewRecords coreSessionKey="test" isReady />),
+    );
+    const scroller = container.querySelector<HTMLElement>(
+      '[data-testid="tool-review-records-primary"]',
+    )!;
+    scroller.scrollTop = 80;
+    await act(async () =>
+      container
+        .querySelector<HTMLButtonElement>('[data-record-id="req_two"]')!
+        .click(),
+    );
+    expect(scroller.scrollTop).toBe(0);
+    await click("返回列表");
+    expect(scroller.scrollTop).toBe(80);
+    const selected = container.querySelector<HTMLButtonElement>(
+      '[data-record-id="req_two"]',
+    )!;
+    expect(document.activeElement).toBe(selected);
+    expect(selected.dataset.state).toBe("selected");
   });
   it("sends nothing while hidden and refreshes once when visible again", async () => {
     let visibility: DocumentVisibilityState = "visible";
@@ -168,7 +256,7 @@ describe("ToolReviewRecords", () => {
     // Start fake time after Radix has restored focus, then restart the poll
     // under that clock through the ordinary refresh action.
     vi.useFakeTimers();
-    await click("刷新最新");
+    await click("刷新");
     await act(async () =>
       container
         .querySelector<HTMLButtonElement>(
@@ -183,8 +271,8 @@ describe("ToolReviewRecords", () => {
     expect(
       container.querySelector('[data-testid="tool-review-details"]')
         ?.textContent,
-    ).toContain("审查命中");
-    await click("返回请求列表");
+    ).toContain("拒绝（仅记录）");
+    await click("返回列表");
     expect(
       container.querySelectorAll('[data-testid="tool-review-record-row"]'),
     ).toHaveLength(0);

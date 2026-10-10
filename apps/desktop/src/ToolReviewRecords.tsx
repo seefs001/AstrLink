@@ -1,19 +1,20 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { listRequestRecords, getRequestRecord } from "./bridge";
 import { DataRow } from "./components/DataRow";
 import { EmptyState } from "./components/EmptyState";
 import { FilterSelect } from "./components/FilterSelect";
 import { HelpPopover } from "./components/HelpPopover";
-import { StatusBadge } from "./components/StatusBadge";
+import { ActionGroup } from "./components/ActionGroup";
+import { IconButton } from "./components/IconButton";
+import { HelpDisclosure } from "./components/HelpDisclosure";
+import { FormMessage } from "./components/FormMessage";
+import { ArrowLeft, ChevronRight, RefreshCw } from "./components/icons";
 import { Button } from "./components/ui/button";
 import { useT } from "./i18n";
-import {
-  statusLabel,
-  statusTone,
-  type RequestRecord,
-} from "./request-record-model";
+import { statusLabel, type RequestRecord } from "./request-record-model";
 import { ToolReviewBadge, ToolReviewDetails } from "./ToolReviewDetails";
 import {
+  hasVisibleToolReview,
   toolReviewStatuses,
   type ToolReviewStatus,
 } from "./tool-review-record-model";
@@ -40,8 +41,26 @@ export function ToolReviewRecords({
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(false);
   const tokenKey = JSON.stringify(localAccessTokenIds);
+  const scroller = useRef<HTMLDivElement>(null);
+  const listScroll = useRef(0);
+  const lastSelected = useRef<string | null>(null);
+  useLayoutEffect(() => {
+    if (scroller.current)
+      scroller.current.scrollTop = selected ? 0 : listScroll.current;
+    if (!selected && lastSelected.current) {
+      const row = Array.from(
+        scroller.current?.querySelectorAll<HTMLButtonElement>(
+          "[data-record-id]",
+        ) ?? [],
+      ).find((node) => node.dataset.recordId === lastSelected.current);
+      row?.focus({ preventScroll: true });
+    }
+  }, [selected?.id]);
 
   useEffect(() => {
+    listScroll.current = 0;
+    lastSelected.current = null;
+    if (scroller.current) scroller.current.scrollTop = 0;
     setRecords([]);
     setSelected(null);
     setCursor(null);
@@ -69,6 +88,7 @@ export function ToolReviewRecords({
         for (let index = 0; index < pages; index++) {
           const page = await listRequestRecords({
             limit: 50,
+            tool_review_only: true,
             ...(filter ? { tool_review_status: filter } : {}),
             ...(next ? { cursor: next } : {}),
             local_access_token_ids: JSON.parse(tokenKey) as string[],
@@ -91,7 +111,13 @@ export function ToolReviewRecords({
           updated = await getRequestRecord(current.id);
         }
         if (cancelled) return;
-        setRecords([...new Map(items.map((item) => [item.id, item])).values()]);
+        setRecords([
+          ...new Map(
+            items
+              .filter((item) => hasVisibleToolReview(item.tool_review))
+              .map((item) => [item.id, item]),
+          ).values(),
+        ]);
         setCursor(next);
         setError(false);
         if (updated)
@@ -128,6 +154,7 @@ export function ToolReviewRecords({
       <div className="flex shrink-0 flex-wrap items-center gap-2 border-b py-2">
         {selected ? (
           <Button size="sm" variant="outline" onClick={() => setSelected(null)}>
+            <ArrowLeft aria-hidden="true" />
             {t("toolReview.backToList")}
           </Button>
         ) : (
@@ -139,50 +166,46 @@ export function ToolReviewRecords({
             onChange={(value) => setFilter(value as ToolReviewStatus | "")}
             options={[
               { label: t("common.all"), value: "" },
-              ...toolReviewStatuses.map((value) => ({
-                value,
-                label: t(`toolReview.status.${value}`),
-              })),
+              ...toolReviewStatuses
+                .filter((value) => value !== "not_applicable")
+                .map((value) => ({
+                  value,
+                  label: t(`toolReview.status.${value}`),
+                })),
             ]}
           />
         )}
         <HelpPopover label={t("toolReview.requestsTab")}>
           {t("toolReview.requestsHint")}
         </HelpPopover>
-        <Button
-          className="ml-auto"
-          size="sm"
-          variant="outline"
-          disabled={!isReady || loading}
-          onClick={() => {
-            setPages(1);
-            setRefresh((value) => value + 1);
-          }}
-        >
-          {t("toolReview.refresh")}
-        </Button>
+        <ActionGroup>
+          <IconButton
+            label={t("common.refresh")}
+            variant="outline"
+            disabled={!isReady || loading}
+            onClick={() => {
+              setPages(1);
+              setRefresh((value) => value + 1);
+            }}
+          >
+            <RefreshCw aria-hidden="true" />
+          </IconButton>
+        </ActionGroup>
       </div>
       {error ? (
-        <p
-          role="alert"
-          className="shrink-0 py-2 text-sm text-danger-foreground"
-        >
+        <FormMessage tone="error" className="shrink-0 my-2">
           {t("toolReview.listFailed")}
-        </p>
+        </FormMessage>
       ) : null}
       <div
-        className="min-h-0 flex-1 overflow-y-auto overscroll-contain"
+        ref={scroller}
+        className="min-h-0 min-w-0 flex-1 overflow-y-auto overscroll-contain"
+        data-tab-scroller
         data-testid="tool-review-records-primary"
         aria-busy={loading}
       >
         {selected ? (
           <div className="space-y-3 py-3">
-            <div className="flex flex-wrap items-center gap-2 text-sm">
-              <span className="break-all font-mono">{selected.id}</span>
-              <StatusBadge tone={statusTone(selected.status)}>
-                {t("toolReview.recordOutcome")}: {statusLabel(selected.status)}
-              </StatusBadge>
-            </div>
             {selected.tool_review ? (
               <ToolReviewDetails summary={selected.tool_review} />
             ) : (
@@ -190,6 +213,12 @@ export function ToolReviewRecords({
                 {t("toolReview.noCalls")}
               </p>
             )}
+            <HelpDisclosure title={t("toolReview.requestDetails")}>
+              <span className="break-all font-mono">{selected.id}</span>
+              <span>
+                {t("toolReview.recordOutcome")}: {statusLabel(selected.status)}
+              </span>
+            </HelpDisclosure>
           </div>
         ) : (
           <>
@@ -202,30 +231,50 @@ export function ToolReviewRecords({
                 <DataRow
                   asChild
                   key={record.id}
-                  className="w-full flex-wrap text-left hover:bg-accent"
+                  className="w-full flex-wrap text-left hover:bg-accent data-[state=selected]:bg-accent focus-visible:outline-2 focus-visible:outline-ring"
                 >
                   <button
                     type="button"
                     data-testid="tool-review-record-row"
-                    onClick={() => setSelected(record)}
+                    data-record-id={record.id}
+                    data-state={
+                      lastSelected.current === record.id
+                        ? "selected"
+                        : undefined
+                    }
+                    onClick={() => {
+                      listScroll.current = scroller.current?.scrollTop ?? 0;
+                      lastSelected.current = record.id;
+                      setSelected(record);
+                    }}
                   >
                     <span className="min-w-0 flex-1">
                       <span className="block truncate text-sm font-medium">
                         {record.requested_model ?? record.input_protocol}
                       </span>
-                      <span className="block break-all font-mono text-xs text-muted-foreground">
-                        {record.id}
-                      </span>
-                      <span className="text-xs text-muted-foreground">
-                        {record.started_at}
+                      <span
+                        className="text-xs text-muted-foreground"
+                        title={record.started_at}
+                      >
+                        {t("toolReview.callCount", {
+                          count: record.tool_review?.calls.length ?? 0,
+                        })}{" "}
+                        ·{" "}
+                        {new Date(record.started_at).toLocaleTimeString([], {
+                          hour: "2-digit",
+                          minute: "2-digit",
+                          second: "2-digit",
+                          hour12: false,
+                        })}
                       </span>
                     </span>
-                    <StatusBadge tone={statusTone(record.status)}>
-                      {statusLabel(record.status)}
-                    </StatusBadge>
                     {record.tool_review ? (
                       <ToolReviewBadge summary={record.tool_review} />
                     ) : null}
+                    <ChevronRight
+                      className="size-3.5 shrink-0 text-muted-foreground"
+                      aria-hidden="true"
+                    />
                   </button>
                 </DataRow>
               ))

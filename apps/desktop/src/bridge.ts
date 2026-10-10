@@ -1,4 +1,11 @@
 import { isWebEdition } from "./edition";
+import {
+  parsePendingToolApprovals,
+  parseToolApprovalDetail,
+  validateApprovalId,
+  validateApprovalDecision,
+} from "./tool-review-approval-model";
+import { parseToolReviewApproval } from "./tool-review-record-model";
 import { webInvoke, RAW_CHANGED } from "./web-transport";
 import {
   parseServiceTestResult,
@@ -638,6 +645,9 @@ export async function listRequestRecords(
     await invoke<unknown>("list_request_records", {
       query: {
         ...compactQuery(query),
+        ...(query.tool_review_only === undefined
+          ? {}
+          : { tool_review_only: query.tool_review_only }),
         ...(query.tool_review_status === undefined
           ? {}
           : { tool_review_status: query.tool_review_status }),
@@ -989,6 +999,61 @@ export async function dismissProviderImport(id: string): Promise<void> {
 export async function listPrivacyPolicies(): Promise<PrivacyPolicyPage> {
   requireNativeBridge();
   return parsePrivacyPolicyPage(await invoke<unknown>("list_privacy_policies"));
+}
+
+export async function listToolReviewApprovals() {
+  requireNativeBridge();
+  return parsePendingToolApprovals(
+    await invoke<unknown>("list_tool_review_approvals"),
+  );
+}
+export async function getToolReviewApproval(approvalId: string) {
+  requireNativeBridge();
+  validateApprovalId(approvalId);
+  return parseToolApprovalDetail(
+    await invoke<unknown>("get_tool_review_approval", { approvalId }),
+    { id: approvalId },
+  );
+}
+export async function decideToolReviewApproval(
+  approvalId: string,
+  decision: "allow" | "deny",
+) {
+  requireNativeBridge();
+  validateApprovalId(approvalId);
+  validateApprovalDecision(decision);
+  const approval = parseToolReviewApproval(
+    await invoke<unknown>("decide_tool_review_approval", {
+      approvalId,
+      decision,
+    }),
+  );
+  if (
+    approval.id !== approvalId ||
+    approval.state !== (decision === "allow" ? "approved" : "denied")
+  )
+    throw new Error("tool_review_approval_invalid");
+  return approval;
+}
+export async function openToolReviewApprovalNativeWindow() {
+  requireNativeBridge();
+  await invoke<void>("open_tool_review_approval_window");
+}
+export async function listenToolReviewApprovalState(
+  onChange: (status: "loading" | "ready" | "offline") => void,
+): Promise<() => void> {
+  if (!hasNativeBridge()) return () => {};
+  return listen<{ status: string }>(
+    "tool-review-approval:state",
+    ({ payload }) => {
+      if (
+        payload.status === "loading" ||
+        payload.status === "ready" ||
+        payload.status === "offline"
+      )
+        onChange(payload.status);
+    },
+  );
 }
 
 export async function getToolReviewSettings(): Promise<ToolReviewSettingsRecord> {

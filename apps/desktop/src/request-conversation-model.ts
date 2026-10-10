@@ -11,6 +11,7 @@ import {
   type TrajectoryTone,
 } from "./request-trajectory-model";
 import type { ResponseOutput } from "./response-preview-model";
+import type { ToolLocationFailure } from "./tool-review-location";
 
 /**
  * The conversation view reads a session the way the operator experienced it:
@@ -48,6 +49,7 @@ export interface ToolResult {
 
 /** A tool the model asked for, paired with what the client brought back. */
 export interface ConversationToolCall {
+  reviewIndex?: number;
   id: string | null;
   name: string;
   args: string;
@@ -57,6 +59,8 @@ export interface ConversationToolCall {
 
 /** What one call's captured content yields once parsed. */
 export interface ParsedCall {
+  toolLocationFailure?: ToolLocationFailure;
+  contentVersion?: string;
   requestId: string;
   user: UserText | null;
   toolResults: ToolResult[];
@@ -466,6 +470,9 @@ export function pairToolCalls(
             (candidate) => candidate.id === null && candidate.name === null,
           )));
     return {
+      ...(tool.reviewIndex === undefined
+        ? {}
+        : { reviewIndex: tool.reviewIndex }),
       id: tool.id ?? null,
       name: tool.name ?? "",
       args: tool.text,

@@ -17,7 +17,11 @@ type Runner struct {
 	Resume      func(State) error
 	Binding     func() (string, string)
 	Store       *Store
-	Executor    Executor
+	// DeferPublication hands the staged state to an outer delivery gate. The
+	// caller must Commit only after confirmed delivery, or Discard on failure.
+	// Without this hook, Run commits after its own emitter finishes successfully.
+	DeferPublication func(*Publication)
+	Executor         Executor
 	// Model uses the normal gateway pipeline, with tool interception disabled.
 	Model   func(context.Context, Object) (Object, error)
 	Observe func(kind string, config contract.BuiltinTool, started time.Time, result Result, err error)
@@ -332,14 +336,33 @@ func (runner Runner) Run(ctx context.Context, writer http.ResponseWriter, princi
 		// A provider-owned base response stays fixed while internal rounds
 		// replay the locally accumulated history after that base.
 		if !used || pendingClient {
-			if err := runner.Store.Put(principal, String(emitter.response["id"]), state); err != nil {
+			if err := ctx.Err(); err != nil {
 				return fail(err)
+			}
+			publication, err := runner.Store.Stage(principal, String(emitter.response["id"]), state)
+			if err != nil {
+				return fail(err)
+			}
+			if err := ctx.Err(); err != nil {
+				publication.Discard()
+				return fail(err)
+			}
+			if runner.DeferPublication != nil {
+				runner.DeferPublication(publication)
+			} else {
+				defer publication.Discard()
 			}
 			if response["status"] == "incomplete" {
 				emitter.response["status"] = "incomplete"
 				emitter.response["incomplete_details"] = response["incomplete_details"]
 			}
-			return emitter.finish()
+			if err := emitter.finish(); err != nil {
+				return err
+			}
+			if runner.DeferPublication != nil {
+				return nil
+			}
+			return publication.Commit()
 		}
 	}
 }

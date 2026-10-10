@@ -1,6 +1,6 @@
 // @vitest-environment happy-dom
 
-import { act } from "react";
+import { act, StrictMode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -56,6 +56,7 @@ vi.mock("./response-preview-model", async (importOriginal) => {
 import type { AuditSettings } from "./audit-settings-model";
 import type { RawSealingState } from "./raw-sealing-model";
 import { RequestRecords } from "./RequestRecords";
+import type { ToolReviewJump } from "./tool-review-navigation";
 import { WorkspaceSnapshotProvider } from "./workspace-snapshots";
 import {
   displayRequestStatus,
@@ -505,7 +506,11 @@ describe("RequestRecords", () => {
   });
 
   // These tests read the trace; the conversation default has its own test.
-  const renderRecords = async (session = "session-1", services = [service]) => {
+  const renderRecords = async (
+    session = "session-1",
+    services = [service],
+    toolJump?: ToolReviewJump,
+  ) => {
     await act(async () => {
       reactRoot.render(
         <RequestRecords
@@ -513,6 +518,7 @@ describe("RequestRecords", () => {
           accessTokensReady
           coreSessionKey={session}
           initialDetailTab="trajectory"
+          toolJump={toolJump}
           services={services}
           isReady
         />,
@@ -523,6 +529,275 @@ describe("RequestRecords", () => {
       await Promise.resolve();
     });
   };
+
+  const reviewedRecord: RequestRecord = {
+    ...firstRecord,
+    session_id: "session_review",
+    input_preview: "Exact review session",
+    tool_review: {
+      status: "passed",
+      mode: "mark",
+      model: "reviewer",
+      config_revision: "1",
+      started_at: firstRecord.started_at,
+      latency_ms: 1,
+      calls: [
+        {
+          index: 0,
+          name: "same_name",
+          action: "delivered",
+          verdict: "pass",
+          model: "reviewer",
+          latency_ms: 1,
+        },
+      ],
+    },
+  };
+  const jump: ToolReviewJump = {
+    version: 1,
+    target: "main",
+    sessionId: "session_review",
+    requestId: reviewedRecord.id,
+    reviewIndex: 0,
+    nonce: "jump_1",
+  };
+
+  it.each(["missing", "locked", "undelivered"] as const)(
+    "opens the exact request conversation for %s bodies instead of rejecting navigation",
+    async (failure) => {
+      const current =
+        failure !== "undelivered"
+          ? reviewedRecord
+          : {
+              ...reviewedRecord,
+              tool_review: {
+                ...reviewedRecord.tool_review!,
+                calls: reviewedRecord.tool_review!.calls.map((call) => ({
+                  ...call,
+                  action: "withheld" as const,
+                })),
+              },
+            };
+      bridgeMocks.getRequestSession.mockResolvedValue(sessionDetail(current));
+      bridgeMocks.getRequestAuditContent.mockResolvedValue({
+        request_id: current.id,
+        request_body: null,
+        response_content:
+          failure === "undelivered"
+            ? {
+                media_type: "application/json",
+                content: '{"status":"completed","output":[]}',
+                truncated: false,
+                captured_bytes: 34,
+              }
+            : null,
+        upstream_request_body: null,
+        upstream_response_content: null,
+        http_meta: null,
+        upstream_http_meta: null,
+        withheld:
+          failure === "locked"
+            ? { response_content: { reason: "raw_locked" } }
+            : {},
+      });
+      await renderRecords("session-1", [service], jump);
+      await flush();
+      expect(
+        container.querySelector("#request-detail-heading")?.textContent,
+      ).toBe("Exact review session");
+      expect(
+        container.querySelector('[data-testid="request-conversation"]'),
+      ).not.toBeNull();
+      expect(
+        container.querySelector('[data-testid="tool-review-location-status"]')
+          ?.textContent,
+      ).toContain(i18n.t(`toolReview.location.${failure}`));
+      expect(bridgeMocks.getRequestAuditContent).toHaveBeenCalledWith(
+        current.id,
+      );
+      expect(bridgeMocks.unlockRaw).not.toHaveBeenCalled();
+      expect(bridgeMocks.updateAuditSettings).not.toHaveBeenCalled();
+      expect(notifyMocks.error).not.toHaveBeenCalled();
+      await renderRecords("session-1", [service], {
+        ...jump,
+        nonce: "jump_again",
+      });
+      expect(bridgeMocks.getRequestSession).toHaveBeenCalledTimes(2);
+    },
+  );
+
+  it("opens a jump under the application StrictMode effect replay", async () => {
+    bridgeMocks.getRequestSession.mockResolvedValue(
+      sessionDetail(reviewedRecord),
+    );
+    await act(async () => {
+      reactRoot.render(
+        <StrictMode>
+          <RequestRecords
+            accessTokens={[]}
+            accessTokensReady
+            coreSessionKey="session-1"
+            services={[service]}
+            isReady
+            toolJump={jump}
+          />
+        </StrictMode>,
+      );
+    });
+    await flush();
+    expect(
+      container.querySelector("#request-detail-heading")?.textContent,
+    ).toBe("Exact review session");
+    expect(
+      container.querySelector('[data-testid="tool-review-location-status"]'),
+    ).not.toBeNull();
+  });
+
+  it("opens retry child identity but does not substitute the root tool card", async () => {
+    const root = { ...reviewedRecord, child_count: 1 };
+    const child = {
+      ...reviewedRecord,
+      id: "req_child",
+      parent_request_id: root.id,
+      attempt_index: 2,
+    };
+    bridgeMocks.getRequestSession.mockResolvedValue(sessionDetail(root));
+    bridgeMocks.getRequestRecord.mockResolvedValue(child);
+    bridgeMocks.listRequestRecordChildren.mockResolvedValue({
+      items: [child],
+      next_cursor: null,
+    });
+    await renderRecords("session-1", [service], {
+      ...jump,
+      requestId: child.id,
+    });
+    await flush();
+    expect(
+      container.querySelector("#request-detail-heading")?.textContent,
+    ).toBe("Exact review session");
+    expect(bridgeMocks.getRequestRecord).toHaveBeenCalledWith(child.id);
+    expect(bridgeMocks.getRequestAuditContent).toHaveBeenCalledWith(child.id);
+    expect(
+      container.querySelector('[data-testid="tool-review-location-status"]')
+        ?.textContent,
+    ).toBe(i18n.t("toolReview.location.unreliable"));
+    expect(container.querySelector('[data-tool-selected="true"]')).toBeNull();
+  });
+
+  it.each([false, true])(
+    "ignores a late jump session after %s/new selection",
+    async (manual) => {
+      const pending = deferred<ReturnType<typeof sessionDetail>>();
+      bridgeMocks.getRequestSession.mockImplementation(async (id: string) =>
+        id === jump.sessionId
+          ? pending.promise
+          : sessionDetail({ ...secondRecord, session_id: secondRecord.id }),
+      );
+      await renderRecords("session-1", [service], jump);
+      if (manual) {
+        await act(async () =>
+          container
+            .querySelector<HTMLButtonElement>(
+              `[data-session-id="${secondRecord.id}"]`,
+            )!
+            .click(),
+        );
+      } else {
+        await renderRecords("session-1", [service], {
+          ...jump,
+          sessionId: secondRecord.id,
+          requestId: secondRecord.id,
+          nonce: "jump_next",
+        });
+      }
+      await flush();
+      expect(
+        container.querySelector("#request-detail-heading")?.textContent,
+      ).toBe(secondRecord.requested_model);
+      await act(async () => pending.resolve(sessionDetail(reviewedRecord)));
+      await flush();
+      expect(
+        container.querySelector("#request-detail-heading")?.textContent,
+      ).toBe(secondRecord.requested_model);
+      expect(bridgeMocks.getRequestAuditContent).not.toHaveBeenCalledWith(
+        reviewedRecord.id,
+      );
+    },
+  );
+
+  it("does not let a late same-session poll overwrite a newer jump target", async () => {
+    const running = {
+      ...reviewedRecord,
+      status: "pending" as const,
+      completed_at: null,
+    };
+    bridgeMocks.getRequestSession.mockResolvedValue(sessionDetail(running));
+    await renderRecords("session-1", [service], jump);
+    const poll = deferred<ReturnType<typeof sessionDetail>>();
+    bridgeMocks.getRequestSession.mockReturnValueOnce(poll.promise);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1000);
+    });
+    const next = { ...reviewedRecord, id: "req_next", turn_index: 2 };
+    bridgeMocks.getRequestSession.mockResolvedValue({
+      ...sessionDetail(running),
+      turns: [running, next],
+    });
+    await renderRecords("session-1", [service], {
+      ...jump,
+      requestId: next.id,
+      nonce: "jump_next",
+    });
+    await flush();
+    expect(bridgeMocks.getRequestAuditContent).toHaveBeenCalledWith(next.id);
+    expect(
+      container.querySelector('[data-testid="tool-review-location-status"]'),
+    ).not.toBeNull();
+    await act(async () =>
+      poll.resolve({ ...sessionDetail(running), title: "Stale poll" }),
+    );
+    await flush();
+    expect(
+      container.querySelector("#request-detail-heading")?.textContent,
+    ).toBe("Exact review session");
+    expect(
+      container.querySelector('[data-testid="tool-review-location-status"]'),
+    ).not.toBeNull();
+  });
+
+  it("ignores late retry metadata after selecting a different request", async () => {
+    const pending = deferred<RequestRecord>();
+    const root = { ...reviewedRecord, child_count: 1 };
+    bridgeMocks.getRequestSession.mockImplementation(async (id: string) =>
+      id === jump.sessionId ? sessionDetail(root) : sessionDetail(secondRecord),
+    );
+    bridgeMocks.getRequestRecord.mockReturnValue(pending.promise);
+    await renderRecords("session-1", [service], {
+      ...jump,
+      requestId: "req_child",
+    });
+    await act(async () =>
+      container
+        .querySelector<HTMLButtonElement>(
+          `[data-session-id="${secondRecord.id}"]`,
+        )!
+        .click(),
+    );
+    await act(async () =>
+      pending.resolve({
+        ...reviewedRecord,
+        id: "req_child",
+        parent_request_id: root.id,
+      }),
+    );
+    await flush();
+    expect(
+      container.querySelector("#request-detail-heading")?.textContent,
+    ).toBe(secondRecord.requested_model);
+    expect(bridgeMocks.getRequestAuditContent).not.toHaveBeenCalledWith(
+      "req_child",
+    );
+  });
 
   it.each([
     ["claude_code", "Claude Code", ""],
@@ -3838,31 +4113,72 @@ describe("RequestRecords", () => {
     expect(window.confirm).not.toHaveBeenCalled();
   });
 
-  it("offers request-level server review filtering without extending session queries", async () => {
-    bridgeMocks.listRequestRecords.mockResolvedValue({
-      items: [firstRecord],
-      next_cursor: null,
-    });
+  it("keeps only ordinary request categories at the top level and never polls a separate review list", async () => {
     await renderRecords();
-    const tab = Array.from(
-      container.querySelectorAll<HTMLButtonElement>('[role="tab"]'),
-    ).find((item) => item.textContent === "按请求审查")!;
-    await act(async () =>
-      tab.dispatchEvent(
-        new MouseEvent("mousedown", { bubbles: true, button: 0 }),
+    expect(
+      Array.from(
+        container.querySelectorAll('[role="tab"]'),
+        (tab) => tab.textContent,
       ),
-    );
+    ).toEqual(["模型调用", "模型获取", "全部"]);
     expect(
       container.querySelector('[data-testid="tool-review-records"]'),
-    ).not.toBeNull();
-    expect(bridgeMocks.listRequestRecords).toHaveBeenCalledWith(
-      expect.objectContaining({ limit: 50 }),
-    );
+    ).toBeNull();
+    expect(
+      container.querySelector('[data-testid="tool-review-settings"]'),
+    ).toBeNull();
+    expect(bridgeMocks.listRequestRecords).not.toHaveBeenCalled();
     expect(
       bridgeMocks.listRequestSessions.mock.calls.every(
-        ([query]) => !("tool_review_status" in query),
+        ([query]) =>
+          !("tool_review_status" in query) && !("tool_review_only" in query),
       ),
     ).toBe(true);
+  });
+
+  it("collapses auxiliary performance only while the browser trajectory inspector is visible", async () => {
+    await renderRecords();
+    await act(async () =>
+      container
+        .querySelector<HTMLButtonElement>(
+          `[data-session-id="${firstRecord.id}"]`,
+        )!
+        .click(),
+    );
+    await act(async () => exactButton("追踪").click());
+    const performance = () =>
+      container.querySelector<HTMLElement>(
+        '[data-testid="session-performance"]',
+      )!;
+    const close = async () => {
+      await act(async () =>
+        container
+          .querySelector<HTMLButtonElement>(
+            '[data-testid="trajectory-inspector-close"]',
+          )!
+          .click(),
+      );
+    };
+    expect(performance().hidden).toBe(true);
+    await close();
+    expect(performance().hidden).toBe(false);
+    await act(async () =>
+      container
+        .querySelector<HTMLButtonElement>(
+          '[data-testid="trajectory-row"][data-chip="CLIENT"]',
+        )!
+        .click(),
+    );
+    expect(performance().hidden).toBe(true);
+    await act(async () => exactButton("对话").click());
+    expect(performance().hidden).toBe(false);
+    expect(
+      container.querySelector('[data-testid="request-trajectory-workspace"]'),
+    ).toBeNull();
+    await act(async () => exactButton("追踪").click());
+    expect(performance().hidden).toBe(true);
+    await close();
+    expect(performance().hidden).toBe(false);
   });
 
   it("refreshes pending child reviews without changing the attempt count", async () => {
@@ -3945,7 +4261,12 @@ describe("RequestRecords", () => {
         ) as HTMLButtonElement
       ).click(),
     );
-    expect(container.textContent).toContain("审查中");
+    expect(
+      container.querySelector('[data-testid="tool-review-badge"]'),
+    ).toBeNull();
+    expect(
+      container.querySelector('[data-testid="tool-review-details"]'),
+    ).toBeNull();
     latest = {
       ...latest,
       tool_review: {
@@ -3957,7 +4278,27 @@ describe("RequestRecords", () => {
     await act(async () => {
       await vi.advanceTimersByTimeAsync(1000);
     });
-    expect(container.textContent).toContain("审查命中");
+    // The conversation has no duplicated review badge or card. Open the current
+    // request inspector from the ordinary trajectory tab instead.
+    expect(
+      container.querySelector('[data-testid="tool-review-details"]'),
+    ).toBeNull();
+    expect(
+      container.querySelector('[data-testid="tool-review-badge"]'),
+    ).toBeNull();
+    await act(async () => exactButton("追踪").click());
+    const reviewTab = container.querySelector<HTMLButtonElement>(
+      '[data-testid="inspector-tab"][data-chip="TOOL_REVIEW"]',
+    )!;
+    expect(reviewTab).not.toBeNull();
+    expect(
+      container.querySelector('[data-testid="tool-review-details"]'),
+    ).toBeNull();
+    await act(async () => reviewTab.click());
+    expect(
+      container.querySelectorAll('[data-testid="tool-review-details"]'),
+    ).toHaveLength(1);
+    expect(container.textContent).toContain("拒绝（仅记录）");
     const count = bridgeMocks.getRequestSession.mock.calls.length;
     await act(async () => {
       await vi.advanceTimersByTimeAsync(3000);

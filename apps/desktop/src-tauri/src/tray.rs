@@ -123,6 +123,7 @@ const ID_QUIT: &str = "quit";
 const ID_CORE_START: &str = "core:start";
 const ID_CORE_STOP: &str = "core:stop";
 const ID_CORE_RESTART: &str = "core:restart";
+const ID_TOOL_REVIEW_APPROVAL: &str = "tool-review:approval";
 
 // ---------------------------------------------------------------------------
 // Model
@@ -241,6 +242,8 @@ pub enum TrayAction {
     /// Opens the raw access approval window, which lists pending requests
     /// and running grants.
     RawAccess,
+    /// Reopens the live tool-review approval queue after dismissal.
+    ToolReviewApproval,
     Quit,
 }
 
@@ -1182,6 +1185,16 @@ fn fallback_menu(app: &AppHandle, model: &TrayModel) -> tauri::Result<Menu<Wry>>
     items.push(
         MenuItem::with_id(
             app,
+            ID_TOOL_REVIEW_APPROVAL,
+            crate::tool_review_approval::title(locale),
+            true,
+            None::<&str>,
+        )?
+        .kind(),
+    );
+    items.push(
+        MenuItem::with_id(
+            app,
             ID_SETTINGS,
             t("host.tray.settings"),
             true,
@@ -1205,6 +1218,9 @@ fn handle_fallback_menu(app: &AppHandle, id: &str) {
         ID_CORE_START => run_core(app, CoreOp::Start),
         ID_CORE_STOP => run_core(app, CoreOp::Stop),
         ID_CORE_RESTART => run_core(app, CoreOp::Restart),
+        ID_TOOL_REVIEW_APPROVAL => {
+            let _ = crate::tool_review_approval::open(app, true);
+        }
         other => eprintln!("unhandled AstrLink tray item: {other}"),
     }
 }
@@ -1308,6 +1324,10 @@ pub fn perform(app: &AppHandle, action: TrayAction) -> Result<(), String> {
         TrayAction::RawAccess => {
             hide_popover(app);
             crate::raw_approval::open(app, true)?;
+        }
+        TrayAction::ToolReviewApproval => {
+            hide_popover(app);
+            crate::tool_review_approval::open(app, true)?;
         }
         TrayAction::Quit => quit(app),
     }
@@ -2481,6 +2501,11 @@ mod tests {
         let action: TrayAction =
             serde_json::from_value(serde_json::json!({"kind": "raw_access"})).unwrap();
         assert_eq!(action, TrayAction::RawAccess);
+        let action: TrayAction = serde_json::from_value(serde_json::json!({
+            "kind": "tool_review_approval"
+        }))
+        .unwrap();
+        assert_eq!(action, TrayAction::ToolReviewApproval);
         assert!(
             serde_json::from_value::<TrayAction>(serde_json::json!({"kind": "explode"})).is_err()
         );

@@ -847,7 +847,7 @@ func (handler *Handler) executeCandidatesWithTest(
 						}
 					}
 				}
-				if session.toolReview != nil {
+				if session.toolReviewActive {
 					session.afterToolReview = succeeded
 				} else {
 					succeeded()

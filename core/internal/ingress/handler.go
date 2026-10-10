@@ -65,6 +65,7 @@ type Dependencies struct {
 	AuditSettings            AuditSettingsProvider
 	ToolReviewSettings       ToolReviewSettingsProvider
 	ToolReviewer             toolreview.Reviewer
+	ToolReviewApprovals      *toolreview.Broker
 	AuditBlobs               AuditBlobPersister
 	RecordLogger             func(string, ...any)
 	AllowedHost              string
@@ -130,6 +131,7 @@ type Handler struct {
 	auditSettings            AuditSettingsProvider
 	toolReviewSettings       ToolReviewSettingsProvider
 	toolReviewer             toolreview.Reviewer
+	toolReviewApprovals      *toolreview.Broker
 	toolReviewSlots          chan struct{}
 	auditBlobs               AuditBlobPersister
 	recordLogger             func(string, ...any)
@@ -274,6 +276,7 @@ func NewWithDependencies(dependencies Dependencies) *Handler {
 		auditSettings:         dependencies.AuditSettings,
 		toolReviewSettings:    dependencies.ToolReviewSettings,
 		toolReviewer:          dependencies.ToolReviewer,
+		toolReviewApprovals:   dependencies.ToolReviewApprovals,
 		toolReviewSlots:       make(chan struct{}, 16),
 		auditBlobs:            dependencies.AuditBlobs,
 		recordLogger:          dependencies.RecordLogger,
@@ -351,7 +354,7 @@ func (handler *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Requ
 			handler.finishToolReview(review, session)
 			defer review.cancel(nil)
 			if session.afterToolReview != nil && session.status == contract.RequestStatusPending &&
-				(session.toolReview.Mode == contract.ToolReviewModeMark || session.toolReview.Status == "passed" || session.toolReview.Status == "not_applicable") {
+				toolReviewAllowsSuccess(session.toolReview) {
 				session.afterToolReview()
 			}
 			session.afterToolReview = nil
@@ -361,6 +364,17 @@ func (handler *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Requ
 		}
 		if request.Context().Err() != nil && !errors.Is(context.Cause(request.Context()), errToolReviewCollectionTimeout) {
 			session.noteCancelled()
+		}
+		if publication := session.builtinPublication; publication != nil {
+			session.builtinPublication = nil
+			defer publication.Discard()
+			if session.status == contract.RequestStatusSucceeded {
+				if err := publication.Commit(); err != nil {
+					session.status = contract.RequestStatusFailed
+					summary := errorSummaryFromInference("builtin_state_unavailable", "builtin continuation state could not be published", false)
+					session.errorSummary = &summary
+				}
+			}
 		}
 		if mode := builtinInternalFrom(request.Context()); mode == nil {
 			handler.noteCodexTurn(classified, session)

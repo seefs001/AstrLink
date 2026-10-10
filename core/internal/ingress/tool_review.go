@@ -48,7 +48,7 @@ func (handler *Handler) prepareToolReview(writer http.ResponseWriter, request *h
 	settings, key, err := handler.toolReviewSettings.LoadToolReviewSettings(request.Context())
 	defer clear(key)
 	credentialUnavailable := err != nil && settings.Enabled &&
-		(settings.Mode == contract.ToolReviewModeMark || settings.Mode == contract.ToolReviewModeReject)
+		(settings.Mode == contract.ToolReviewModeMark || settings.Mode == contract.ToolReviewModeReject || settings.Mode == contract.ToolReviewModeAsk)
 	if err != nil && !credentialUnavailable {
 		return nil, request, errors.New("tool review configuration unavailable")
 	}
@@ -67,10 +67,9 @@ func (handler *Handler) prepareToolReview(writer http.ResponseWriter, request *h
 		output.inputError = "credential_unavailable"
 	}
 	if session := recordSessionFromContext(request.Context()); session != nil {
-		pending := output.summary("pending", "")
-		pending.CompletedAt = nil
-		session.toolReview = &pending
-		session.persistPending(request.Context(), handler.requestRecords, handler.recordLogger)
+		// Delivery gating is independent of persisted review metadata. A
+		// request with no tools must not need a placeholder review record.
+		session.toolReviewActive = true
 	}
 	// Parsing this bounded copy never rewrites what the upstream receives.
 	// Convo's usual 4096-byte preview must not become the review's source text.
@@ -140,7 +139,7 @@ type toolReviewWriter struct {
 
 func (writer *toolReviewWriter) Unwrap() http.ResponseWriter { return writer.ResponseWriter }
 func (writer *toolReviewWriter) rejecting() bool {
-	return writer.snapshot.Settings.Mode == contract.ToolReviewModeReject
+	return writer.snapshot.Settings.Mode == contract.ToolReviewModeReject || writer.snapshot.Settings.Mode == contract.ToolReviewModeAsk
 }
 
 func (writer *toolReviewWriter) WriteHeader(status int) {
@@ -157,7 +156,13 @@ func (writer *toolReviewWriter) WriteHeader(status int) {
 		writer.fault = "encoded_response"
 	}
 	if writer.streaming {
-		writer.mode = streamingRestoreMode(writer.Header().Get("Content-Type"))
+		// Chat, Responses and Anthropic stream SSE even when an upstream omits
+		// Content-Type (notably Codex). Only Gemini also supports JSON streams.
+		// The protocol collector still requires a complete, valid terminal.
+		writer.mode = restoreModeSSE
+		if writer.protocol == contract.ProtocolGoogleGenerateContent {
+			writer.mode = streamingRestoreMode(writer.Header().Get("Content-Type"))
+		}
 		if writer.mode == restoreModeText {
 			writer.fault = "unsupported_response_format"
 		}
@@ -426,10 +431,16 @@ func (writer *toolReviewWriter) emit(raw []byte) error {
 
 func (writer *toolReviewWriter) summary(status, code string) contract.ToolReviewSummary {
 	now := time.Now().UTC()
-	return contract.ToolReviewSummary{Status: status, Mode: writer.snapshot.Settings.Mode,
-		Model: writer.snapshot.Settings.Model, ConfigRevision: writer.snapshot.Settings.Revision,
+	threshold := writer.snapshot.Settings.RejectThreshold
+	batchCalls := writer.snapshot.Settings.BatchCalls
+	calls := []contract.ToolReviewCall{}
+	if status == "pending" {
+		calls = toolreview.PendingCalls(writer.input.Calls, writer.snapshot.Settings.Model)
+	}
+	return contract.ToolReviewSummary{Status: status, Mode: writer.snapshot.Settings.Mode, Backend: writer.snapshot.Settings.Backend,
+		Model: writer.snapshot.Settings.Model, ConfigRevision: writer.snapshot.Settings.Revision, RejectThreshold: &threshold, BatchCalls: &batchCalls,
 		StartedAt: writer.startedAt, CompletedAt: &now, LatencyMS: int(now.Sub(writer.startedAt).Milliseconds()),
-		Calls: []contract.ToolReviewCall{}, ErrorCode: code}
+		Calls: calls, ErrorCode: code}
 }
 
 // finish runs before the final request record is saved. A mark-mode job is
@@ -447,9 +458,19 @@ func (handler *Handler) finishToolReview(writer *toolReviewWriter, session *reco
 	}
 	defer func() { writer.collector = nil; writer.carry = nil; writer.jsonPrefix = nil; writer.buffer.Reset() }()
 	if writer.passthrough || writer.status == 0 {
-		result := writer.summary("not_applicable", "")
-		session.toolReview = &result
 		return
+	}
+	// Inspect a complete buffered response even after cancellation: unlike
+	// streaming frames it has not reached the collector yet. This distinguishes
+	// actual tools and malformed responses from ordinary no-tool cancellation.
+	if !writer.streaming && session.toolReviewEOF && writer.fault == "" {
+		if _, err := writer.collector.Observe(writer.carry); err != nil {
+			writer.fault = reviewErrorCode(err)
+		}
+		if writer.rejecting() {
+			_, _ = writer.buffer.Write(writer.carry)
+		}
+		writer.carry = nil
 	}
 	cause := context.Cause(writer.ctx)
 	if cause != nil && writer.rejecting() && !writer.held && writer.streaming && writer.collector.Complete() && writer.fault == "" {
@@ -458,13 +479,25 @@ func (handler *Handler) finishToolReview(writer *toolReviewWriter, session *reco
 		// by its adapter still has to pass the actual publication check.
 		if err := writer.confirmDelivery(); err == nil {
 			cause = nil
+		} else if !errors.Is(err, context.Canceled) {
+			writer.fault = "client_delivery_failed"
 		}
 	}
 	if errors.Is(cause, errToolReviewCollectionTimeout) {
 		writer.fault = "collection_timeout"
+	} else if cause != nil && writer.fault == "" && !writer.collector.SawTool() && !writer.collector.Complete() {
+		// Cancellation before any client tool was observed is an ordinary
+		// request cancellation, not a review. Existing collection faults must
+		// still take the failure path, even when no safe calls are available.
+		if writer.rejecting() {
+			session.status = contract.RequestStatusCancelled
+		}
+		return
 	} else if cause != nil && writer.rejecting() {
-		result := writer.summary("cancelled", "cancelled")
-		session.toolReview = &result
+		if writer.collector.SawTool() || writer.fault != "" {
+			result := writer.summary("cancelled", "cancelled")
+			session.toolReview = &result
+		}
 		// A generated response buffered by the gate was not delivered.
 		session.status = contract.RequestStatusCancelled
 		return
@@ -472,19 +505,8 @@ func (handler *Handler) finishToolReview(writer *toolReviewWriter, session *reco
 	if !writer.streaming && !session.toolReviewEOF {
 		writer.fault = "incomplete_response"
 	}
-	if writer.fault == "" {
-		if !writer.streaming {
-			_, err := writer.collector.Observe(writer.carry)
-			if err != nil {
-				writer.fault = reviewErrorCode(err)
-			}
-			if writer.rejecting() {
-				_, _ = writer.buffer.Write(writer.carry)
-			}
-			writer.carry = nil
-		} else if len(bytes.TrimSpace(writer.carry)) != 0 || len(writer.jsonPrefix) != 0 || writer.jsonKind == jsonRestoreArray {
-			writer.fault = "incomplete_response"
-		}
+	if writer.fault == "" && writer.streaming && (len(bytes.TrimSpace(writer.carry)) != 0 || len(writer.jsonPrefix) != 0 || writer.jsonKind == jsonRestoreArray) {
+		writer.fault = "incomplete_response"
 	}
 	if writer.fault == "" && !writer.collector.Complete() && session.toolReviewEOF && cause == nil {
 		if err := writer.collector.Finish(); err != nil {
@@ -502,7 +524,7 @@ func (handler *Handler) finishToolReview(writer *toolReviewWriter, session *reco
 			writer.fault = writer.inputError
 		}
 	}
-	if !writer.rejecting() && writer.streaming {
+	if !writer.rejecting() {
 		if err := writer.confirmDelivery(); err != nil {
 			writer.fault = "client_delivery_failed"
 			writer.deliveryFailed(session)
@@ -522,10 +544,10 @@ func (handler *Handler) finishToolReview(writer *toolReviewWriter, session *reco
 		return
 	}
 	if len(writer.input.Calls) == 0 {
-		result := writer.summary("not_applicable", "")
-		session.toolReview = &result
 		if writer.rejecting() {
 			if err := writer.deliverReviewed(); err != nil {
+				result := writer.summary("failed", "client_delivery_failed")
+				session.toolReview = &result
 				writer.deliveryFailed(session)
 			}
 		}
@@ -547,6 +569,11 @@ func (handler *Handler) finishToolReview(writer *toolReviewWriter, session *reco
 		}
 		pending := writer.summary("pending", "")
 		pending.CompletedAt = nil
+		// Review is pending, not delivery: mark mode has already relayed and
+		// confirmed these calls before admitting this background job.
+		for i := range pending.Calls {
+			pending.Calls[i].Action = "delivered"
+		}
 		session.toolReview = &pending
 		snapshot, input, id := writer.snapshot, writer.input, session.id
 		ctx, stop := context.WithDeadline(context.WithoutCancel(writer.ctx), deadline)
@@ -557,10 +584,32 @@ func (handler *Handler) finishToolReview(writer *toolReviewWriter, session *reco
 		}
 		return
 	}
+	pending := writer.summary("pending", "")
+	pending.CompletedAt = nil
+	session.toolReview = &pending
+	session.persistPending(writer.ctx, handler.requestRecords, handler.recordLogger)
 	ctx, stop := context.WithDeadline(writer.ctx, deadline)
 	defer stop()
 	result := handler.toolReviewer.Review(ctx, writer.snapshot, writer.input)
+	stop() // The reviewer budget never covers the human wait.
 	session.toolReview = &result
+	if writer.snapshot.Settings.Mode == contract.ToolReviewModeAsk && writer.ctx.Err() == nil {
+		needsApproval := result.Status == "flagged"
+		for _, call := range result.Calls {
+			if call.Verdict == "error" {
+				needsApproval = false
+			}
+		}
+		if toolreview.CanAskOnError(result) {
+			needsApproval = writer.snapshot.Settings.AskOnReviewError
+			// An error takes precedence over a flag in a mixed batch.
+			result.Status = "failed"
+		}
+		if needsApproval {
+			handler.awaitToolApproval(writer, session, &result)
+			return
+		}
+	}
 	if writer.ctx.Err() != nil {
 		session.status = contract.RequestStatusCancelled
 		result.Status, result.ErrorCode = "cancelled", "cancelled"
@@ -597,9 +646,13 @@ func (writer *toolReviewWriter) deliverReviewed() error {
 }
 
 func (writer *toolReviewWriter) confirmDelivery() error {
+	return confirmClientDelivery(writer.ResponseWriter)
+}
+
+func confirmClientDelivery(output http.ResponseWriter) error {
 	// WebSocket adapters may retain a success terminal for admission ordering.
 	// Confirm its publication too before declaring the reviewed batch delivered.
-	for downstream := writer.ResponseWriter; downstream != nil; {
+	for downstream := output; downstream != nil; {
 		if delivery, ok := downstream.(interface{ ConfirmToolReviewDelivery() error }); ok {
 			return delivery.ConfirmToolReviewDelivery()
 		}
@@ -609,7 +662,13 @@ func (writer *toolReviewWriter) confirmDelivery() error {
 		}
 		downstream = wrapper.Unwrap()
 	}
-	return nil
+	// A successful Write may only have entered the net/http small body buffer.
+	// Confirm HTTP socket publication before delivered/success/affinity effects.
+	err := http.NewResponseController(output).Flush()
+	if errors.Is(err, http.ErrNotSupported) {
+		return nil
+	}
+	return err
 }
 
 func (writer *toolReviewWriter) deliveryFailed(session *recordSession) {
@@ -627,7 +686,9 @@ func (writer *toolReviewWriter) deliveryFailed(session *recordSession) {
 	if writer.ctx.Err() != nil {
 		session.status = contract.RequestStatusCancelled
 		if session.toolReview != nil {
-			session.toolReview.Status, session.toolReview.ErrorCode = "cancelled", "cancelled"
+			if session.toolReview.Approval == nil {
+				session.toolReview.Status, session.toolReview.ErrorCode = "cancelled", "cancelled"
+			}
 		}
 	}
 	summary := errorSummaryFromInference("client_delivery_failed", "reviewed response could not be delivered", false)

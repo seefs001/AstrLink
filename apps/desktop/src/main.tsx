@@ -20,6 +20,8 @@ import { AppErrorBoundary } from "./AppErrorBoundary";
 import { getPreferences } from "./bridge";
 import { applyLocale, i18n, useT } from "./i18n";
 import { RawAccessApprovalWindow } from "./RawAccessApprovalWindow";
+import { ToolReviewApprovalWindow } from "./ToolReviewApprovalWindow";
+import { isToolReviewApprovalWindow } from "./tool-review-approval-window";
 import { isRawAccessApprovalWindow } from "./raw-access-approval-window";
 import { TrajectoryInspectorWindow } from "./TrajectoryInspectorWindow";
 import { isTrajectoryInspectorWindow } from "./trajectory-inspector-window";
@@ -105,12 +107,14 @@ function LocaleGate({ children }: { children: ReactNode }) {
 // Every window loads this bundle; the label decides which app it becomes.
 const surface = isWebEdition ? (
   <ConsoleEntry>
-    <App />
+    {isToolReviewApprovalWindow() ? <ToolReviewApprovalWindow /> : <App />}
   </ConsoleEntry>
 ) : trayPopover ? (
   <TrayPopoverWindow />
 ) : isTrajectoryInspectorWindow() ? (
   <TrajectoryInspectorWindow />
+) : isToolReviewApprovalWindow() ? (
+  <ToolReviewApprovalWindow />
 ) : isRawAccessApprovalWindow() ? (
   <RawAccessApprovalWindow />
 ) : (

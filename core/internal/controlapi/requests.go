@@ -122,8 +122,8 @@ func parseRequestSessionListOptions(request *http.Request) (storage.RequestSessi
 		return storage.RequestSessionListOptions{}, fmt.Errorf("kind must be inference or discovery")
 	}
 	query.Del("kind")
-	if query.Has("q") || query.Has("tool_review_status") {
-		return storage.RequestSessionListOptions{}, fmt.Errorf("q and tool_review_status are only supported on request records")
+	if query.Has("q") || query.Has("tool_review_status") || query.Has("tool_review_only") {
+		return storage.RequestSessionListOptions{}, fmt.Errorf("q, tool_review_status and tool_review_only are only supported on request records")
 	}
 	recordOptions, err := parseRequestRecordQuery(query)
 	if err != nil {
@@ -706,7 +706,7 @@ func parseRequestRecordListOptions(request *http.Request) (storage.RequestRecord
 func parseRequestRecordQuery(query url.Values) (storage.RequestRecordListOptions, error) {
 	for name, values := range query {
 		switch name {
-		case "limit", "cursor", "from", "to", "protocol", "service_id", "status", "tool_review_status", "q":
+		case "limit", "cursor", "from", "to", "protocol", "service_id", "status", "tool_review_status", "tool_review_only", "q":
 			if len(values) != 1 {
 				return storage.RequestRecordListOptions{}, fmt.Errorf("query parameter must occur once")
 			}
@@ -786,6 +786,12 @@ func parseRequestRecordQuery(query url.Values) (storage.RequestRecordListOptions
 			return options, fmt.Errorf("invalid status filter")
 		}
 		options.Status = &status
+	}
+	if values, ok := query["tool_review_only"]; ok {
+		if values[0] != "true" && values[0] != "false" {
+			return options, fmt.Errorf("invalid tool_review_only filter")
+		}
+		options.ToolReviewOnly = values[0] == "true"
 	}
 	if values, ok := query["tool_review_status"]; ok {
 		if !contract.ValidToolReviewStatus(values[0]) {

@@ -1,4 +1,11 @@
 import { i18n } from "./i18n";
+import {
+  parsePendingToolApprovals,
+  parseToolApprovalDetail,
+  validateApprovalId,
+  validateApprovalDecision,
+} from "./tool-review-approval-model";
+import { parseToolReviewApproval } from "./tool-review-record-model";
 import { webText } from "./web-copy";
 import {
   parseToolReviewSettingsRecord,
@@ -31,6 +38,7 @@ export async function consoleRequest(
   method: Method = "GET",
   body?: unknown,
   etag?: string,
+  signal?: AbortSignal,
 ) {
   if (!/^\/(?:control|console)\/v1\//.test(path))
     throw new Error("Invalid console path");
@@ -49,6 +57,7 @@ export async function consoleRequest(
     headers,
     redirect: "error",
     cache: "no-store",
+    ...(signal ? { signal } : {}),
   };
   if (method !== "GET" && body !== undefined)
     options.body = JSON.stringify(body);
@@ -144,6 +153,45 @@ async function toolReviewSettings(a: Args, method: "GET" | "PATCH") {
           : "tool_review_settings_rejected"
         : "tool_review_settings_unavailable",
     );
+  }
+}
+async function toolApproval(
+  a: Args,
+  operation: "list" | "detail" | "decision",
+) {
+  if (operation !== "list") validateApprovalId(a.approvalId);
+  if (operation === "decision") validateApprovalDecision(a.decision);
+  const abort = new AbortController();
+  const timeout = setTimeout(() => abort.abort(), 5000);
+  try {
+    const { value } = await consoleRequest(
+      `/control/v1/tool-review/approvals${operation === "list" ? "" : `/${a.approvalId}${operation === "decision" ? "/decision" : ""}`}`,
+      operation === "decision" ? "POST" : "GET",
+      operation === "decision" ? { decision: a.decision } : undefined,
+      undefined,
+      abort.signal,
+    );
+    if (operation === "list") {
+      parsePendingToolApprovals(value);
+      return value;
+    }
+    if (operation === "detail")
+      return parseToolApprovalDetail(value, { id: a.approvalId as string });
+    return parseToolReviewApproval(value);
+  } catch (error) {
+    throw new Error(
+      error instanceof ConsoleError
+        ? error.status === 423
+          ? "raw_locked"
+          : [404, 409, 410].includes(error.status)
+            ? "tool_review_approval_not_pending"
+            : [401, 403].includes(error.status)
+              ? "tool_review_approval_forbidden"
+              : "tool_review_approval_unavailable"
+        : "tool_review_approval_unavailable",
+    );
+  } finally {
+    clearTimeout(timeout);
   }
 }
 const proof = (a: Args) =>
@@ -391,6 +439,9 @@ const commands: Record<string, Command> = {
   pause_privacy_model_installation: route((a) => `${model(a)}/pause`, "POST"),
   resume_privacy_model_installation: route((a) => `${model(a)}/resume`, "POST"),
   delete_privacy_model_installation: route(model, "DELETE"),
+  list_tool_review_approvals: (a) => toolApproval(a, "list"),
+  get_tool_review_approval: (a) => toolApproval(a, "detail"),
+  decide_tool_review_approval: (a) => toolApproval(a, "decision"),
   get_tool_review_settings: (a) => toolReviewSettings(a, "GET"),
   update_tool_review_settings: (a) => toolReviewSettings(a, "PATCH"),
   get_routing_settings: route("/routing-settings"),

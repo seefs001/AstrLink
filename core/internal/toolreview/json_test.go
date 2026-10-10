@@ -70,7 +70,11 @@ func TestJevFieldCaseAliasesFailClosed(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = io.WriteString(w, body) }))
 		s := toolreview.NewClient(server.Client()).Review(context.Background(), reviewSnapshot(server.URL, contract.ToolReviewModeReject), singleInput())
 		server.Close()
-		if s.Status != "failed" || s.ErrorCode != "invalid_response" || s.Calls[0].Action != "withheld" {
+		wantCode := "reviewer_invalid_review"
+		if strings.Contains(body, `"Answers"`) {
+			wantCode = "reviewer_invalid_json"
+		}
+		if s.Status != "failed" || s.ErrorCode != wantCode || s.Calls[0].Action != "withheld" {
 			t.Fatalf("Jev alias accepted: %+v", s)
 		}
 	}

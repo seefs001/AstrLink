@@ -94,6 +94,14 @@ func (c *Collector) responseSnapshot(snapshot responseSnapshot) error {
 	if (snapshot.Status != "completed" && snapshot.Status != "incomplete") || snapshot.Output == nil {
 		return safeError("incomplete_response")
 	}
+	// Some streaming providers send output_item.done snapshots followed by a
+	// successful terminal with output: []. Only independently validated item
+	// snapshots may supply calls omitted by that empty terminal. A nonempty
+	// terminal remains authoritative and must account for every collected call.
+	emptyFinal := c.streaming && snapshot.Status == "completed" && len(*snapshot.Output) == 0 && len(c.calls) > 0
+	if c.complete && emptyFinal != c.responseEmptyFinal {
+		return safeError("conflicting_call")
+	}
 	seen := make(map[string]bool)
 	for i, item := range *snapshot.Output {
 		if snapshot.Status == "incomplete" {
@@ -116,12 +124,16 @@ func (c *Collector) responseSnapshot(snapshot responseSnapshot) error {
 	if snapshot.Status == "incomplete" && c.saw {
 		return safeError("incomplete_response")
 	}
-	for key := range c.calls {
-		if !seen[key] {
+	for key, call := range c.calls {
+		if !seen[key] && !(emptyFinal && call.responseItemDone) {
 			return safeError("conflicting_call")
 		}
 	}
-	return c.finish()
+	if err := c.finish(); err != nil {
+		return err
+	}
+	c.responseEmptyFinal = emptyFinal
+	return nil
 }
 
 func (c *Collector) observeResponses(payload []byte) error {
@@ -184,7 +196,14 @@ func (c *Collector) observeResponses(payload []byte) error {
 		if event.Index == nil || event.Item == nil {
 			return safeError("incomplete_call")
 		}
-		return c.responseItem(*event.Index, *event.Item, event.Type == "response.output_item.done")
+		final := event.Type == "response.output_item.done"
+		if err := c.responseItem(*event.Index, *event.Item, final); err != nil {
+			return err
+		}
+		if final && (event.Item.Type == "function_call" || event.Item.Type == "custom_tool_call") {
+			c.calls["response:"+strconv.Itoa(*event.Index)].responseItemDone = true
+		}
+		return nil
 	case "response.function_call_arguments.delta", "response.function_call_arguments.done", "response.custom_tool_call_input.delta", "response.custom_tool_call_input.done":
 		c.saw, c.contains = true, true
 		key := ""

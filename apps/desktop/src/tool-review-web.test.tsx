@@ -7,6 +7,7 @@ import {
   getToolReviewSettings,
   updateToolReviewSettings,
   listRequestRecords,
+  listRequestSessions,
 } from "./bridge";
 import { CONSOLE_SIGNED_OUT, webInvoke } from "./web-transport";
 import { SafetyPolicy } from "./SafetyPolicy";
@@ -50,7 +51,17 @@ afterEach(async () => {
 describe("tool review in the Web edition", () => {
   it("wraps operator settings with the strong ETag without needing a native bridge", async () => {
     fetchMock.mockResolvedValueOnce(response(settings, 200, { ETag: etag }));
-    expect(await getToolReviewSettings()).toEqual({ settings, etag });
+    expect(await getToolReviewSettings()).toEqual({
+      settings: {
+        ...settings,
+        reject_threshold: 0.5,
+        ask_on_review_error: false,
+        approval_timeout_ms: 120000,
+        batch_calls: false,
+        backend: "jev",
+      },
+      etag,
+    });
     expect(fetchMock).toHaveBeenCalledWith(
       "/control/v1/tool-review-settings",
       expect.objectContaining({
@@ -60,6 +71,66 @@ describe("tool review in the Web edition", () => {
         cache: "no-store",
       }),
     );
+  });
+  it("carries Responses backend, exact endpoint and replacement key through operator HTTP without echoing the key", async () => {
+    const endpoint = "https://response.example/custom/exact/responses";
+    const result = {
+      ...settings,
+      backend: "responses",
+      endpoint,
+      model: "schema-fixture-model",
+      credential_configured: true,
+    };
+    fetchMock.mockResolvedValueOnce(response(result, 200, { ETag: etag }));
+    const patch = {
+      backend: "responses" as const,
+      endpoint,
+      model: "schema-fixture-model",
+      api_key: "synthetic-new-responses-key",
+      data_transfer_acknowledged: true,
+    };
+    const saved = await updateToolReviewSettings(etag, patch);
+    expect(saved.settings.backend).toBe("responses");
+    expect(saved.settings.endpoint).toBe(endpoint);
+    expect(saved.settings).not.toHaveProperty("api_key");
+    expect(fetchMock).toHaveBeenLastCalledWith(
+      "/control/v1/tool-review-settings",
+      expect.objectContaining({ method: "PATCH", body: JSON.stringify(patch) }),
+    );
+    fetchMock.mockClear();
+    await expect(
+      updateToolReviewSettings(etag, {
+        backend: "openai",
+      } as unknown as Parameters<typeof updateToolReviewSettings>[1]),
+    ).rejects.toThrow("Invalid tool review settings");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+  it("reads and writes explicit batch mode through the real operator settings route", async () => {
+    fetchMock.mockResolvedValueOnce(
+      response({ ...settings, batch_calls: true }, 200, { ETag: etag }),
+    );
+    expect((await getToolReviewSettings()).settings.batch_calls).toBe(true);
+    fetchMock.mockResolvedValueOnce(
+      response({ ...settings, batch_calls: false }, 200, { ETag: etag }),
+    );
+    expect(
+      (await updateToolReviewSettings(etag, { batch_calls: false })).settings
+        .batch_calls,
+    ).toBe(false);
+    expect(fetchMock).toHaveBeenLastCalledWith(
+      "/control/v1/tool-review-settings",
+      expect.objectContaining({
+        method: "PATCH",
+        body: JSON.stringify({ batch_calls: false }),
+      }),
+    );
+    fetchMock.mockClear();
+    await expect(
+      updateToolReviewSettings(etag, {
+        batch_calls: "true",
+      } as unknown as Parameters<typeof updateToolReviewSettings>[1]),
+    ).rejects.toThrow("Invalid tool review settings");
+    expect(fetchMock).not.toHaveBeenCalled();
   });
   it("saves from SafetyPolicy with in-app consent, If-Match and no returned credential", async () => {
     fetchMock.mockImplementation(async (path: string, options: RequestInit) => {
@@ -128,6 +199,7 @@ describe("tool review in the Web edition", () => {
     expect(JSON.parse(saves[0][1].body)).toMatchObject({
       enabled: true,
       api_key: "write-only-test-key",
+      reject_threshold: 0.5,
       data_transfer_acknowledged: true,
     });
     expect(key.value).toBe("");
@@ -206,6 +278,7 @@ describe("tool review in the Web edition", () => {
     fetchMock.mockResolvedValueOnce(response({ items: [], next_cursor: null }));
     await listRequestRecords({
       tool_review_status: "flagged",
+      tool_review_only: true,
       limit: 50,
       cursor: "x+y",
       local_access_token_ids: ["token_a", "token_b"],
@@ -219,5 +292,15 @@ describe("tool review in the Web edition", () => {
       "token_b",
     ]);
     expect(url.searchParams.get("limit")).toBe("50");
+    expect(url.searchParams.get("tool_review_only")).toBe("true");
+    fetchMock.mockResolvedValueOnce(response({ items: [], next_cursor: null }));
+    const sessionQuery = { limit: 50, tool_review_only: true };
+    await listRequestSessions(sessionQuery);
+    const sessionURL = new URL(
+      fetchMock.mock.calls[1][0],
+      "https://console.example",
+    );
+    expect(sessionURL.pathname).toBe("/control/v1/request-sessions");
+    expect(sessionURL.searchParams.has("tool_review_only")).toBe(false);
   });
 });

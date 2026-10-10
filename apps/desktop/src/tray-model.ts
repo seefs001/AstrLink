@@ -142,6 +142,7 @@ export type TrayAction =
   | { kind: "core"; op: "start" | "stop" | "restart" }
   | { kind: "refresh" }
   | { kind: "raw_access" }
+  | { kind: "tool_review_approval" }
   | { kind: "quit" };
 
 const phases = new Set<CorePhase>([

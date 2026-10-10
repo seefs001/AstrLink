@@ -1,4 +1,4 @@
-import type { HTMLAttributes, ReactNode } from "react";
+import type { ComponentProps, HTMLAttributes, ReactNode } from "react";
 import { Slot } from "radix-ui";
 
 import { cn } from "@/lib/utils";
@@ -64,10 +64,7 @@ export function PanelHeader({
 }
 
 /** Fill the panel and keep long content inside its own scrolling region. */
-export function PanelBody({
-  className,
-  ...props
-}: HTMLAttributes<HTMLDivElement>) {
+export function PanelBody({ className, ...props }: ComponentProps<"div">) {
   return (
     <div
       className={cn(

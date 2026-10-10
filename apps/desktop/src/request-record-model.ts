@@ -332,6 +332,7 @@ export interface RequestRecordPage {
 }
 
 export interface RequestRecordListQuery {
+  tool_review_only?: boolean;
   tool_review_status?: ToolReviewStatus;
   limit?: number;
   cursor?: string;

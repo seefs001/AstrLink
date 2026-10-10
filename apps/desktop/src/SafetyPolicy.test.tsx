@@ -341,12 +341,14 @@ describe("SafetyPolicy", () => {
         prompt: "{{user_request}}\n{{tool_call}}",
         mode: "mark",
         timeout_ms: 5000,
+        reject_threshold: 0.5,
         revision: "r1",
         credential_configured: true,
       },
       etag,
     });
     await renderPolicy("tool-review-independent");
+    expect(bridgeMocks.getToolReviewSettings).not.toHaveBeenCalled();
     await openPolicySection("工具审查");
     expect(
       container.querySelector('[data-testid="tool-review-settings"]'),
@@ -360,7 +362,7 @@ describe("SafetyPolicy", () => {
     ).toContain("flex-col");
   });
 
-  it("keeps the tool review draft when switching internal policy tabs", async () => {
+  it("keeps the tool review draft and scroll when switching internal policy tabs", async () => {
     bridgeMocks.getToolReviewSettings.mockResolvedValue({
       settings: {
         enabled: false,
@@ -369,16 +371,38 @@ describe("SafetyPolicy", () => {
         prompt: "{{user_request}}\n{{tool_call}}",
         mode: "mark",
         timeout_ms: 5000,
+        reject_threshold: 0.5,
         revision: "r1",
         credential_configured: true,
       },
       etag,
     });
     await renderPolicy("tool-review-tabs");
+    expect(bridgeMocks.getToolReviewSettings).not.toHaveBeenCalled();
+    for (const name of [
+      "检测与还原",
+      "脱敏规则",
+      "试运行",
+      "模型",
+      "工具审查",
+    ]) {
+      const tab = Array.from(container.querySelectorAll('[role="tab"]')).find(
+        (tab) => tab.textContent === name,
+      );
+      expect(tab).toBeDefined();
+      expect(tab!.querySelector("svg")).not.toBeNull();
+    }
     await openPolicySection("工具审查");
-    await flush();
     await setInput("#tool-review-endpoint", "https://draft.example.com/check");
     await setInput("#tool-review-key", "unsaved-key");
+    await setInput("#tool-review-threshold", "80");
+    const scroller = container.querySelector<HTMLElement>(
+      '[data-testid="tool-review-primary"]',
+    )!;
+    scroller.scrollTop = 80;
+    await act(async () =>
+      scroller.dispatchEvent(new Event("scroll", { bubbles: true })),
+    );
     await openPolicySection("脱敏规则");
     expect(
       container
@@ -396,6 +420,11 @@ describe("SafetyPolicy", () => {
     expect(
       container.querySelector<HTMLInputElement>("#tool-review-key")?.value,
     ).toBe("unsaved-key");
+    expect(
+      container.querySelector<HTMLInputElement>("#tool-review-threshold")
+        ?.value,
+    ).toBe("80");
+    expect(scroller.scrollTop).toBe(80);
     expect(bridgeMocks.getToolReviewSettings).toHaveBeenCalledOnce();
   });
 

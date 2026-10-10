@@ -25,6 +25,7 @@ import (
 	"github.com/QuantumNous/astrlink/core/internal/servicemodel"
 	"github.com/QuantumNous/astrlink/core/internal/servicetest"
 	"github.com/QuantumNous/astrlink/core/internal/storage/sqlite"
+	"github.com/QuantumNous/astrlink/core/internal/toolreview"
 )
 
 // installOutboundProxy configures the outbound proxy once per process,
@@ -217,6 +218,7 @@ func openPersistentCore(ctx context.Context, options persistentOptions) (*persis
 	}
 	resolver.WithRuntimeProfile(contract.RuntimeProfile{RelayKitAvailable: true, Edges: conversionEngine.Edges()})
 	resolver.WithSubscriptionBaseURL(subscriptionManager.APIBaseURL())
+	approvals := toolreview.NewBroker(ctx)
 	gatewayDependencies := ingress.Dependencies{
 		ProxyCredentials: store,
 		Resolver:         resolver,
@@ -241,6 +243,7 @@ func openPersistentCore(ctx context.Context, options persistentOptions) (*persis
 		RequestRecords:           store,
 		AuditSettings:            store,
 		ToolReviewSettings:       store,
+		ToolReviewApprovals:      approvals,
 		AuditBlobs:               store,
 		RecordLogger:             logf,
 		ConversionEngine:         conversionEngine,
@@ -253,30 +256,31 @@ func openPersistentCore(ctx context.Context, options persistentOptions) (*persis
 	handler, err := controlapi.NewWithDependencies(options.version, controlapi.Dependencies{
 		ServiceStore: store,
 		PricingStore: store, PricingManager: pricingManager,
-		AccessTokenManager: accessTokenManager,
-		PolicyStore:        store,
-		PrivacyModels:      privacyModel,
-		PrivacyFilter:      privacyFilter,
-		PolicyChanged:      privacyWorker.ApplyPolicy,
-		RequestRecords:     store,
-		AuditSettings:      store,
-		ToolReviewSettings: store,
-		AuditKeys:          store,
-		AuditBlobs:         store,
-		RawVault:           rawVault,
-		LocalData:          store,
-		ClientIdentities:   identities,
-		Subscriptions:      subscriptionManager,
-		RateLimits:         resolver,
-		CodingPlans:        codingplan.New(store, nil),
-		ServiceModels:      servicemodel.New(store, subscriptionManager, nil),
-		ServiceTester:      servicetest.NewWithDependencies(gatewayDependencies, subscriptionManager.APIBaseURLFor),
-		BuiltinToolTester:  ingress.NewWithDependencies(gatewayDependencies),
-		ControlToken:       options.controlToken,
-		ObserverToken:      options.observerToken,
-		ConversionEngine:   conversionEngine,
-		Shutdown:           options.shutdown,
-		ConsoleSessions:    options.consoleSessions,
+		AccessTokenManager:  accessTokenManager,
+		PolicyStore:         store,
+		PrivacyModels:       privacyModel,
+		PrivacyFilter:       privacyFilter,
+		PolicyChanged:       privacyWorker.ApplyPolicy,
+		RequestRecords:      store,
+		AuditSettings:       store,
+		ToolReviewSettings:  store,
+		ToolReviewApprovals: approvals,
+		AuditKeys:           store,
+		AuditBlobs:          store,
+		RawVault:            rawVault,
+		LocalData:           store,
+		ClientIdentities:    identities,
+		Subscriptions:       subscriptionManager,
+		RateLimits:          resolver,
+		CodingPlans:         codingplan.New(store, nil),
+		ServiceModels:       servicemodel.New(store, subscriptionManager, nil),
+		ServiceTester:       servicetest.NewWithDependencies(gatewayDependencies, subscriptionManager.APIBaseURLFor),
+		BuiltinToolTester:   ingress.NewWithDependencies(gatewayDependencies),
+		ControlToken:        options.controlToken,
+		ObserverToken:       options.observerToken,
+		ConversionEngine:    conversionEngine,
+		Shutdown:            options.shutdown,
+		ConsoleSessions:     options.consoleSessions,
 	})
 	if err != nil {
 		return fail("configure persistent control API: %w", err)
@@ -296,6 +300,7 @@ func openPersistentCore(ctx context.Context, options persistentOptions) (*persis
 			return err
 		},
 		close: func() error {
+			approvals.Close()
 			// Zero every key an agent grant or the unlock session holds.
 			handler.RevokeRawGrants()
 			rawVault.Lock()

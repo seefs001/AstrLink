@@ -1,6 +1,6 @@
 // @vitest-environment happy-dom
 
-import { act } from "react";
+import { act, StrictMode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -11,6 +11,8 @@ vi.mock("./bridge", () => bridgeMocks);
 
 import type { CopyFeedback } from "./copy-feedback";
 import { RequestConversation } from "./RequestConversation";
+import { i18n } from "./i18n";
+import type { ToolReviewJump } from "./tool-review-navigation";
 import {
   emptyTrajectoryFields,
   type AuditContent,
@@ -284,6 +286,381 @@ describe("RequestConversation", () => {
   afterEach(() => {
     act(() => root.unmount());
     container.remove();
+  });
+
+  const reviewedCalls = calls.map((call) =>
+    call.id !== "req_2"
+      ? call
+      : {
+          ...call,
+          tool_review: {
+            status: "passed" as const,
+            mode: "mark" as const,
+            model: "reviewer",
+            config_revision: "1",
+            started_at: call.started_at,
+            latency_ms: 1,
+            calls: [0, 1].map((index) => ({
+              index,
+              name: "Grep",
+              verdict: "pass" as const,
+              reason_code: "authorized" as const,
+              action: "delivered" as const,
+              latency_ms: 1,
+              model: "reviewer",
+            })),
+          },
+        },
+  );
+  const reviewedBody = content("req_2", anthropicRequest("修这四条"), {
+    ...anthropicResponse([
+      {
+        type: "tool_use",
+        id: "t2_first",
+        name: "Grep",
+        input: { pattern: "first" },
+      },
+      {
+        type: "tool_use",
+        id: "t2_second",
+        name: "Grep",
+        input: { pattern: "second" },
+      },
+    ]),
+    stop_reason: "tool_use",
+  });
+  const jump: ToolReviewJump = {
+    version: 1,
+    target: "main",
+    sessionId: session.id,
+    requestId: "req_2",
+    reviewIndex: 1,
+    nonce: "jump_1",
+  };
+  function tool(index = 1) {
+    return container.querySelector<HTMLElement>(
+      `[data-testid="conversation-tool"][data-request-id="req_2"][data-review-index="${index}"]`,
+    );
+  }
+  function useReviewedBody(value = reviewedBody) {
+    bridgeMocks.getRequestAuditContent.mockImplementation(async (id: string) =>
+      id === "req_2" ? value : contents[id],
+    );
+  }
+
+  it("locates the second same-name tool through folded turn/run/call/tool, repeats, and only scrolls internally", async () => {
+    useReviewedBody();
+    render({ turns: reviewedCalls, selectedRequestId: "req_2" });
+    await flush();
+    await openFirstTurn();
+    await flush();
+    const turn = container.querySelector<HTMLElement>(
+      '[data-testid="conversation-turn"]',
+    )!;
+    const runButton = () =>
+      turn.querySelector<HTMLButtonElement>(
+        '[data-testid="conversation-run"] button[aria-expanded]',
+      )!;
+    await act(async () => runButton().click());
+    const callButton = () =>
+      tool()!
+        .closest('[data-testid="conversation-call"]')!
+        .querySelector<HTMLButtonElement>("button[aria-expanded]")!;
+    await act(async () => callButton().click());
+    await act(async () => runButton().click());
+    await act(async () =>
+      turn
+        .querySelector<HTMLButtonElement>(
+          '[data-testid="conversation-process"] button[aria-expanded]',
+        )!
+        .click(),
+    );
+    expect(tool()).toBeNull();
+    const scroller = container.querySelector<HTMLElement>(
+      '[data-testid="conversation-stream"]',
+    )!;
+    const focus = vi.spyOn(HTMLElement.prototype, "focus");
+    const intoView = vi.spyOn(HTMLElement.prototype, "scrollIntoView");
+    const bounds = vi
+      .spyOn(HTMLElement.prototype, "getBoundingClientRect")
+      .mockImplementation(function (this: HTMLElement) {
+        return {
+          top: this.getAttribute("aria-current") === "true" ? 400 : 100,
+          bottom: 500,
+          height: 100,
+          left: 0,
+          right: 500,
+          width: 500,
+          x: 0,
+          y: 0,
+          toJSON: () => ({}),
+        };
+      });
+    try {
+      document.documentElement.scrollTop = 77;
+      scroller.scrollTop = 20;
+      render({
+        turns: reviewedCalls,
+        selectedRequestId: "req_2",
+        toolJump: jump,
+      });
+      await flush();
+      expect(tool()?.dataset.toolSelected).toBe("true");
+      const announcement = container.querySelector<HTMLElement>(
+        '[data-testid="tool-review-location-status"]',
+      )!;
+      expect(announcement.classList.contains("sr-only")).toBe(true);
+      expect(announcement.getAttribute("aria-live")).toBe("polite");
+      expect(announcement.closest('[data-testid="conversation-stream"]')).toBe(
+        scroller,
+      );
+      expect(announcement.textContent).toBe(
+        i18n.t("toolReview.location.located"),
+      );
+      expect(tool(0)?.dataset.toolSelected).toBeUndefined();
+      expect(tool()?.querySelector("pre")?.textContent).toContain("second");
+      expect(document.activeElement).toBe(tool()?.querySelector("button"));
+      expect(focus).toHaveBeenCalledWith({ preventScroll: true });
+      expect(intoView).not.toHaveBeenCalled();
+      expect(scroller.scrollTop).toBe(256);
+      expect(document.documentElement.scrollTop).toBe(77);
+      expect(runButton().getAttribute("aria-expanded")).toBe("true");
+      // Fold each mounted detail again; a fresh nonce must replay the reveal.
+      await act(async () =>
+        tool()!.querySelector<HTMLButtonElement>("button")!.click(),
+      );
+      await act(async () => callButton().click());
+      await act(async () => runButton().click());
+      const before = focus.mock.calls.length;
+      render({
+        turns: reviewedCalls,
+        selectedRequestId: "req_2",
+        toolJump: { ...jump, nonce: "jump_2" },
+      });
+      await flush();
+      expect(
+        tool()?.querySelector("button")?.getAttribute("aria-expanded"),
+      ).toBe("true");
+      expect(focus.mock.calls.length).toBeGreaterThan(before);
+      const stoppedAt = scroller.scrollTop;
+      render({
+        turns: [...reviewedCalls, record({ id: "req_later", turn_index: 3 })],
+        selectedRequestId: "req_2",
+        toolJump: { ...jump, nonce: "jump_2" },
+      });
+      await flush();
+      expect(scroller.scrollTop).toBe(stoppedAt);
+    } finally {
+      focus.mockRestore();
+      intoView.mockRestore();
+      bounds.mockRestore();
+      document.documentElement.scrollTop = 0;
+    }
+  });
+
+  it("locates after StrictMode replays layout and content effects", async () => {
+    useReviewedBody();
+    await act(async () =>
+      root.render(
+        <StrictMode>
+          <RequestConversation
+            auditContent={null}
+            auditError={null}
+            auditLoading={false}
+            childrenByRoot={{}}
+            copyFeedback={copyFeedback}
+            onSelectRequest={() => {}}
+            outlineOpen
+            rawSealing={null}
+            selectedRequestId="req_2"
+            session={session}
+            turns={reviewedCalls}
+            toolJump={jump}
+          />
+        </StrictMode>,
+      ),
+    );
+    await flush();
+    expect(tool()?.dataset.toolSelected).toBe("true");
+    expect(document.activeElement).toBe(tool()?.querySelector("button"));
+  });
+
+  it.each(["missing", "locked", "undelivered", "unreliable"] as const)(
+    "shows %s fallback in conversation without unlocking",
+    async (failure) => {
+      const body = { ...reviewedBody, withheld: { ...reviewedBody.withheld } };
+      let records = reviewedCalls;
+      if (failure === "missing" || failure === "locked")
+        body.response_content = null;
+      if (failure === "missing") {
+        records = reviewedCalls.map((call) => ({
+          ...call,
+          audit: {
+            ...call.audit,
+            request_body_captured: false,
+            response_content_captured: false,
+          },
+        }));
+      }
+      if (failure === "locked")
+        body.withheld.response_content = {
+          reason: "raw_locked",
+          raw_available: true,
+          media_type: "application/json",
+          truncated: false,
+          captured_bytes: 100,
+        };
+      if (failure === "undelivered")
+        records = reviewedCalls.map((call) =>
+          call.tool_review
+            ? {
+                ...call,
+                tool_review: {
+                  ...call.tool_review,
+                  calls: call.tool_review.calls.map((item) => ({
+                    ...item,
+                    action: "withheld" as const,
+                  })),
+                },
+              }
+            : call,
+        );
+      if (failure === "unreliable")
+        body.response_content = { ...body.response_content!, truncated: true };
+      useReviewedBody(body);
+      const unlock = vi.fn();
+      render({
+        turns: records,
+        selectedRequestId: "req_2",
+        onUnlockRaw: unlock,
+      });
+      await flush();
+      const scroller = container.querySelector<HTMLElement>(
+        '[data-testid="conversation-stream"]',
+      )!;
+      scroller.scrollTop = 300;
+      document.documentElement.scrollTop = 77;
+      render({
+        turns: records,
+        selectedRequestId: "req_2",
+        toolJump: jump,
+        onUnlockRaw: unlock,
+      });
+      await flush();
+      expect(
+        container.querySelector('[data-testid="tool-review-location-status"]')
+          ?.textContent,
+      ).toContain(i18n.t(`toolReview.location.${failure}`));
+      const notice = container.querySelector<HTMLElement>(
+        '[data-testid="tool-review-location-status"]',
+      )!;
+      expect(notice.closest('[data-testid="conversation-stream"]')).toBe(
+        scroller,
+      );
+      expect(notice.getAttribute("role")).toBe("alert");
+      expect(scroller.scrollTop).toBe(0);
+      expect(document.documentElement.scrollTop).toBe(77);
+      document.documentElement.scrollTop = 0;
+      expect(
+        container.querySelector('[data-testid="conversation-locked"]'),
+      ).toBeNull();
+      expect(
+        container.querySelector('[data-testid="conversation-uncaptured"]'),
+      ).toBeNull();
+      expect(container.querySelector('[data-tool-selected="true"]')).toBeNull();
+      expect(unlock).not.toHaveBeenCalled();
+      if (failure === "locked") {
+        await act(async () =>
+          notice.querySelector<HTMLButtonElement>("button")!.click(),
+        );
+        expect(unlock).toHaveBeenCalledTimes(1);
+      }
+    },
+  );
+
+  it("wraps long mixed tool summaries without truncating their names or counts", async () => {
+    const names = ["read_file", "run_shell_mock_only", "web_search_call"];
+    const blocks = Array.from({ length: 33 }, (_, index) => ({
+      type: "tool_use",
+      id: `tool_${index}`,
+      name: names[index === 32 ? 2 : index % 2],
+      input: { index },
+    }));
+    useReviewedBody(
+      content(
+        "req_2",
+        anthropicRequest("mixed tools"),
+        anthropicResponse(blocks),
+      ),
+    );
+    render({ turns: [{ ...calls[1], tool_review: undefined }] });
+    await flush();
+    const summary = container.querySelector<HTMLElement>(
+      '[data-testid="conversation-tools-summary"]',
+    )!;
+    const text = "read_file ×16 · run_shell_mock_only ×16 · web_search_call ×1";
+    expect(summary.textContent).toBe(text);
+    expect(summary.title).toBe(text);
+    expect(summary.classList.contains("whitespace-normal")).toBe(true);
+    expect(summary.classList.contains("[overflow-wrap:anywhere]")).toBe(true);
+    expect(summary.classList.contains("truncate")).toBe(false);
+    expect(
+      summary.parentElement?.parentElement?.classList.contains("flex-wrap"),
+    ).toBe(true);
+  });
+
+  it.each([false, true])(
+    "ignores late body after %s/new target selection",
+    async (newJump) => {
+      let complete!: (value: AuditContent) => void;
+      const pending = new Promise<AuditContent>((resolve) => {
+        complete = resolve;
+      });
+      bridgeMocks.getRequestAuditContent.mockImplementation((id: string) =>
+        id === "req_2" ? pending : Promise.resolve(contents[id]),
+      );
+      render({
+        turns: reviewedCalls,
+        selectedRequestId: "req_2",
+        toolJump: jump,
+      });
+      await flush();
+      render({
+        turns: reviewedCalls,
+        selectedRequestId: "req_3",
+        toolJump: newJump
+          ? { ...jump, requestId: "req_3", nonce: "next" }
+          : null,
+      });
+      await flush();
+      await act(async () => complete(reviewedBody));
+      await flush();
+      expect(container.querySelector('[data-tool-selected="true"]')).toBeNull();
+      expect(
+        document.activeElement?.closest('[data-testid="conversation-tool"]'),
+      ).toBeNull();
+    },
+  );
+
+  it("does not locate a retry child at a root tool with the same name", async () => {
+    useReviewedBody();
+    const child = {
+      ...reviewedCalls[1],
+      id: "req_retry",
+      parent_request_id: "req_2",
+    };
+    render({
+      turns: reviewedCalls,
+      childrenByRoot: { req_2: [child] },
+      selectedRequestId: child.id,
+      toolJump: { ...jump, requestId: child.id },
+    });
+    await flush();
+    expect(
+      container.querySelector('[data-testid="tool-review-location-status"]')
+        ?.textContent,
+    ).toBe(i18n.t("toolReview.location.unreliable"));
+    expect(container.querySelector('[data-tool-selected="true"]')).toBeNull();
   });
 
   it("reads the turns, folds the routine calls and opens the tool failure", async () => {

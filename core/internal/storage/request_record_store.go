@@ -9,6 +9,7 @@ import (
 
 type RequestRecordListOptions struct {
 	ToolReviewStatus    string
+	ToolReviewOnly      bool
 	Limit               int
 	Cursor              string
 	From                *time.Time

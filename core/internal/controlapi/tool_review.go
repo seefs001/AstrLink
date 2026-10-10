@@ -27,13 +27,18 @@ func (handler *Handler) toolReviewSettingsResource(writer http.ResponseWriter, r
 			// Agent observers can diagnose whether review is active without
 			// learning an operator's endpoint or custom reviewer instructions.
 			writeJSON(writer, http.StatusOK, struct {
-				Enabled              bool                    `json:"enabled"`
-				Mode                 contract.ToolReviewMode `json:"mode"`
-				Model                string                  `json:"model"`
-				TimeoutMS            int                     `json:"timeout_ms"`
-				Revision             string                  `json:"revision"`
-				CredentialConfigured bool                    `json:"credential_configured"`
-			}{record.Settings.Enabled, record.Settings.Mode, record.Settings.Model, record.Settings.TimeoutMS, record.Settings.Revision, record.Settings.CredentialConfigured})
+				Backend              contract.ToolReviewBackend `json:"backend"`
+				Enabled              bool                       `json:"enabled"`
+				Mode                 contract.ToolReviewMode    `json:"mode"`
+				Model                string                     `json:"model"`
+				TimeoutMS            int                        `json:"timeout_ms"`
+				RejectThreshold      float64                    `json:"reject_threshold"`
+				BatchCalls           bool                       `json:"batch_calls"`
+				AskOnReviewError     bool                       `json:"ask_on_review_error"`
+				ApprovalTimeoutMS    int                        `json:"approval_timeout_ms"`
+				Revision             string                     `json:"revision"`
+				CredentialConfigured bool                       `json:"credential_configured"`
+			}{record.Settings.Backend, record.Settings.Enabled, record.Settings.Mode, record.Settings.Model, record.Settings.TimeoutMS, record.Settings.RejectThreshold, record.Settings.BatchCalls, record.Settings.AskOnReviewError, record.Settings.ApprovalTimeoutMS, record.Settings.Revision, record.Settings.CredentialConfigured})
 			return
 		}
 		writer.Header().Set("ETag", record.ETag)
@@ -81,6 +86,8 @@ func decodeToolReviewPatch(writer http.ResponseWriter, request *http.Request) (c
 	for name, value := range raw {
 		var target any
 		switch name {
+		case "backend":
+			target = &patch.Backend
 		case "enabled":
 			target = &patch.Enabled
 		case "endpoint":
@@ -93,6 +100,14 @@ func decodeToolReviewPatch(writer http.ResponseWriter, request *http.Request) (c
 			target = &patch.Mode
 		case "timeout_ms":
 			target = &patch.TimeoutMS
+		case "reject_threshold":
+			target = &patch.RejectThreshold
+		case "batch_calls":
+			target = &patch.BatchCalls
+		case "ask_on_review_error":
+			target = &patch.AskOnReviewError
+		case "approval_timeout_ms":
+			target = &patch.ApprovalTimeoutMS
 		case "api_key":
 			target = &patch.APIKey
 		case "data_transfer_acknowledged":

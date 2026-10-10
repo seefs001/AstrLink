@@ -89,18 +89,18 @@ func TestReviewRejectsInvalidAnswersWithoutLeakingOrRetrying(t *testing.T) {
 		{"auth", 401, "secret user body", "unauthorized"},
 		{"rate", 429, "secret user body", "rate_limited"},
 		{"server", 500, "secret user body", "upstream_error"},
-		{"html", 200, "<h1>secret user body</h1>", "invalid_response"},
-		{"enum", 200, strings.Replace(passAnswer, `"choice":"pass"`, `"choice":"unknown"`, 1), "invalid_response"},
-		{"negative", 200, strings.Replace(passAnswer, `"pass":0.8`, `"pass":-0.8`, 1), "invalid_response"},
-		{"distribution", 200, strings.Replace(passAnswer, `"pass":0.8`, `"pass":0.1`, 1), "invalid_response"},
-		{"confidence", 200, strings.Replace(passAnswer, `"confidence":0.6`, `"confidence":1.1`, 1), "invalid_response"},
-		{"overflow", 200, strings.Replace(passAnswer, `"confidence":0.6`, `"confidence":1e9999`, 1), "invalid_response"},
-		{"missing confidence", 200, `{"answers":{"review":{"type":"choice","choice":"pass","probabilities":{"pass":1,"flag":0}}}}`, "invalid_response"},
-		{"missing type", 200, strings.Replace(passAnswer, `"type":"choice",`, "", 1), "invalid_response"},
-		{"empty type", 200, strings.Replace(passAnswer, `"type":"choice"`, `"type":""`, 1), "invalid_response"},
-		{"null type", 200, strings.Replace(passAnswer, `"type":"choice"`, `"type":null`, 1), "invalid_response"},
-		{"wrong type", 200, strings.Replace(passAnswer, `"type":"choice"`, `"type":"score"`, 1), "invalid_response"},
-		{"duplicate", 200, strings.Replace(passAnswer, `"choice":"pass"`, `"choice":"flag","choice":"pass"`, 1), "invalid_response"},
+		{"html", 200, "<h1>secret user body</h1>", "reviewer_invalid_json"},
+		{"enum", 200, strings.Replace(passAnswer, `"choice":"pass"`, `"choice":"unknown"`, 1), "reviewer_invalid_review"},
+		{"negative", 200, strings.Replace(passAnswer, `"pass":0.8`, `"pass":-0.8`, 1), "reviewer_invalid_review"},
+		{"distribution", 200, strings.Replace(passAnswer, `"pass":0.8`, `"pass":0.1`, 1), "reviewer_invalid_review"},
+		{"confidence", 200, strings.Replace(passAnswer, `"confidence":0.6`, `"confidence":1.1`, 1), "reviewer_invalid_review"},
+		{"overflow", 200, strings.Replace(passAnswer, `"confidence":0.6`, `"confidence":1e9999`, 1), "reviewer_invalid_review"},
+		{"missing confidence", 200, `{"answers":{"review":{"type":"choice","choice":"pass","probabilities":{"pass":1,"flag":0}}}}`, "reviewer_invalid_review"},
+		{"missing type", 200, strings.Replace(passAnswer, `"type":"choice",`, "", 1), "reviewer_invalid_review"},
+		{"empty type", 200, strings.Replace(passAnswer, `"type":"choice"`, `"type":""`, 1), "reviewer_invalid_review"},
+		{"null type", 200, strings.Replace(passAnswer, `"type":"choice"`, `"type":null`, 1), "reviewer_invalid_review"},
+		{"wrong type", 200, strings.Replace(passAnswer, `"type":"choice"`, `"type":"score"`, 1), "reviewer_invalid_review"},
+		{"duplicate", 200, strings.Replace(passAnswer, `"choice":"pass"`, `"choice":"flag","choice":"pass"`, 1), "reviewer_invalid_json"},
 		{"too large", 200, strings.Repeat("x", 65537), "invalid_response"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -179,7 +179,7 @@ func TestReviewValidatesActualModelWithoutLeakingIt(t *testing.T) {
 				if s.Status != "passed" || s.Calls[0].Model != want {
 					t.Fatalf("valid model: %+v", s)
 				}
-			} else if s.Status != "failed" || s.ErrorCode != "invalid_response" || s.Calls[0].Model != "jev-latest" {
+			} else if s.Status != "failed" || s.ErrorCode != "reviewer_invalid_model" || s.Calls[0].Model != "jev-latest" {
 				t.Fatalf("invalid model: %+v", s)
 			}
 			data, _ := json.Marshal(s)
@@ -412,7 +412,7 @@ func TestReviewTimeoutCancellationAndNoCalls(t *testing.T) {
 	}
 }
 
-func TestReviewUsesChoiceWithoutProbabilityThresholdAndPreservesCustomText(t *testing.T) {
+func TestReviewUsesThresholdPreservesModelChoiceAndCustomText(t *testing.T) {
 	custom := "*** Begin Patch\n{{user_request}}\n<do not execute>\n"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var request struct {
@@ -435,8 +435,8 @@ func TestReviewUsesChoiceWithoutProbabilityThresholdAndPreservesCustomText(t *te
 	input := singleInput()
 	input.Calls[0] = toolreview.Call{Name: "patch", Custom: true, Arguments: custom}
 	s := toolreview.NewClient(server.Client()).Review(context.Background(), reviewSnapshot(server.URL, contract.ToolReviewModeReject), input)
-	if s.Status != "passed" || s.Calls[0].Verdict != "pass" {
-		t.Fatalf("threshold changed choice: %+v", s)
+	if s.Status != "blocked" || s.Calls[0].Verdict != "flag" || s.Calls[0].ModelVerdict != "pass" {
+		t.Fatalf("threshold or model choice lost: %+v", s)
 	}
 }
 
@@ -469,11 +469,18 @@ func TestReviewSendsOnlyNecessaryDataAndPreservesFullRequest(t *testing.T) {
 		if err := json.Unmarshal(body.State["user_request"], &actual); err != nil || actual != request {
 			t.Error("full request not preserved")
 		}
-		if len(body.State) != 2 || len(body.Questions) != 1 || body.Questions["review"].Type != "choice" || len(body.Questions["review"].Criteria) != 2 {
+		if len(body.State) != 3 || len(body.Questions) != 2 || body.Questions["review"].Type != "choice" || len(body.Questions["review"].Criteria) != 2 || body.Questions["reason"].Type != "choice" || len(body.Questions["reason"].Criteria) != 10 {
 			t.Errorf("invalid Jev schema: %s", data)
 		}
-		if strings.Contains(body.Questions["review"].Instructions, request) {
+		if strings.Contains(body.Questions["review"].Instructions, request) || strings.Contains(body.Questions["reason"].Instructions, request) {
 			t.Error("untrusted data embedded in instructions")
+		}
+		var rules string
+		if err := json.Unmarshal(body.State["review_rules"], &rules); err != nil || rules != body.Questions["review"].Instructions {
+			t.Error("reason policy lost custom review rules")
+		}
+		if !strings.Contains(body.Questions["reason"].Instructions, "untrusted data") || !strings.Contains(body.Questions["reason"].Instructions, "apply only to the separate review question") {
+			t.Error("reason question lacks independent output and trust boundaries")
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, `{"answers":{"review":{"type":"choice","choice":"pass","probabilities":{"pass":0.75,"flag":0.25},"confidence":0.5}}}`)

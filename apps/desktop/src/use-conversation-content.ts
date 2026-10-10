@@ -9,6 +9,7 @@ import {
 } from "./request-conversation-model";
 import type { RequestRecord } from "./request-record-model";
 import { parseResponsePreview } from "./response-preview-model";
+import { locateReviewedOutputs } from "./tool-review-location";
 
 /** Decrypts in flight at once. Bodies run to megabytes, so two is plenty. */
 const CONCURRENCY = 2;
@@ -23,12 +24,14 @@ export interface ConversationContent {
 
 // A pending call's content grows until it settles, and a capture flag that
 // flips means Core now holds a body it did not have. Either reads again.
-function versionOf(record: RequestRecord): string {
+export function conversationContentVersion(record: RequestRecord): string {
   return [
     record.status,
-    record.audit.request_body_captured,
-    record.audit.response_content_captured,
-    record.audit.upstream_response_content_captured,
+    record.completed_at,
+    record.input_protocol,
+    record.streaming,
+    JSON.stringify(record.audit),
+    JSON.stringify(record.tool_review),
   ].join(":");
 }
 
@@ -51,12 +54,18 @@ export function useConversationContent(resetKey: string): ConversationContent {
   const queueRef = useRef<RequestRecord[]>([]);
   const inFlightRef = useRef(new Set<string>());
   const versionRef = useRef(new Map<string, string>());
+  const requestedVersionRef = useRef(new Map<string, string>());
+  const cacheKeyRef = useRef(resetKey);
+  const activeKeyRef = useRef(resetKey);
+  activeKeyRef.current = resetKey;
 
   useEffect(() => {
     generationRef.current += 1;
     queueRef.current = [];
     inFlightRef.current = new Set();
     versionRef.current = new Map();
+    requestedVersionRef.current = new Map();
+    cacheKeyRef.current = resetKey;
     setParsed(new Map());
     setReading(new Set());
     setErrors(new Map());
@@ -71,17 +80,25 @@ export function useConversationContent(resetKey: string): ConversationContent {
 
   const pump = useCallback(() => {
     const generation = generationRef.current;
+    const key = activeKeyRef.current;
     while (
       inFlightRef.current.size < CONCURRENCY &&
       queueRef.current.length > 0
     ) {
-      const record = queueRef.current.shift()!;
-      if (inFlightRef.current.has(record.id)) continue;
+      const next = queueRef.current.findIndex(
+        (record) => !inFlightRef.current.has(record.id),
+      );
+      if (next < 0) break;
+      const [record] = queueRef.current.splice(next, 1);
       inFlightRef.current.add(record.id);
       setReading((current) => new Set(current).add(record.id));
-      const version = versionOf(record);
+      const version = conversationContentVersion(record);
+      const current = () =>
+        generationRef.current === generation && activeKeyRef.current === key;
+      const wanted = () =>
+        current() && requestedVersionRef.current.get(record.id) === version;
       const finish = () => {
-        if (generationRef.current !== generation) return;
+        if (!current()) return;
         inFlightRef.current.delete(record.id);
         setReading((current) => {
           const next = new Set(current);
@@ -93,11 +110,14 @@ export function useConversationContent(resetKey: string): ConversationContent {
       void getRequestAuditContent(record.id)
         .then(async (content) => {
           const part = conversationResponsePart(content);
-          const outputs = part
-            ? (await parseResponsePreview(part)).outputs
-            : [];
-          if (generationRef.current !== generation) return;
-          const call = parseCallContent(record, content, outputs);
+          const preview = part
+            ? await parseResponsePreview(part, undefined, true)
+            : { outputs: [], incomplete: false, unparsed: false };
+          const located = await locateReviewedOutputs(record, content, preview);
+          if (!wanted()) return;
+          const call = parseCallContent(record, content, located.outputs);
+          call.toolLocationFailure = located.failure;
+          call.contentVersion = version;
           versionRef.current.set(record.id, version);
           setParsed((current) => new Map(current).set(record.id, call));
           setErrors((current) => {
@@ -108,7 +128,7 @@ export function useConversationContent(resetKey: string): ConversationContent {
           });
         })
         .catch((error: unknown) => {
-          if (generationRef.current !== generation) return;
+          if (!wanted()) return;
           const message =
             error instanceof Error && error.message
               ? error.message
@@ -123,12 +143,34 @@ export function useConversationContent(resetKey: string): ConversationContent {
     (records: RequestRecord[]) => {
       let queued = false;
       for (const record of records) {
-        const version = versionOf(record);
+        const version = conversationContentVersion(record);
         if (versionRef.current.get(record.id) === version) continue;
-        if (inFlightRef.current.has(record.id)) continue;
-        if (queueRef.current.some((queued) => queued.id === record.id))
+        if (
+          requestedVersionRef.current.get(record.id) === version &&
+          (inFlightRef.current.has(record.id) ||
+            queueRef.current.some((queued) => queued.id === record.id))
+        )
           continue;
-        queueRef.current.push(record);
+        requestedVersionRef.current.set(record.id, version);
+        versionRef.current.delete(record.id);
+        // Invalidate proof immediately, not after a replacement body arrives.
+        setParsed((current) => {
+          if (!current.has(record.id)) return current;
+          const next = new Map(current);
+          next.delete(record.id);
+          return next;
+        });
+        setErrors((current) => {
+          if (!current.has(record.id)) return current;
+          const next = new Map(current);
+          next.delete(record.id);
+          return next;
+        });
+        const at = queueRef.current.findIndex(
+          (queued) => queued.id === record.id,
+        );
+        if (at < 0) queueRef.current.push(record);
+        else queueRef.current[at] = record;
         queued = true;
       }
       if (queued) pump();
@@ -137,7 +179,15 @@ export function useConversationContent(resetKey: string): ConversationContent {
   );
 
   return useMemo(
-    () => ({ parsed, reading, errors, request }),
-    [parsed, reading, errors, request],
+    () =>
+      cacheKeyRef.current === resetKey
+        ? { parsed, reading, errors, request }
+        : {
+            parsed: new Map<string, ParsedCall>(),
+            reading: new Set<string>(),
+            errors: new Map<string, string>(),
+            request,
+          },
+    [parsed, reading, errors, request, resetKey],
   );
 }

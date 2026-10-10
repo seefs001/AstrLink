@@ -109,6 +109,7 @@ function invoked(command: string): boolean {
 describe("RequestTrajectory in a window host", () => {
   let container: HTMLDivElement;
   let root: Root;
+  const onDockedInspectorVisibilityChange = vi.fn();
 
   beforeEach(() => {
     (
@@ -139,6 +140,7 @@ describe("RequestTrajectory in a window host", () => {
     await act(async () => {
       root.render(
         <RequestTrajectory
+          onDockedInspectorVisibilityChange={onDockedInspectorVisibilityChange}
           auditContent={null}
           auditError={null}
           auditLoading={false}
@@ -188,6 +190,7 @@ describe("RequestTrajectory in a window host", () => {
 
   it("leaves the list its full width and keeps no pane beside it", async () => {
     await renderTrajectory();
+    expect(onDockedInspectorVisibilityChange).toHaveBeenLastCalledWith(false);
 
     expect(
       container.querySelectorAll('[data-testid="trajectory-row"]').length,
@@ -478,7 +481,7 @@ describe("RequestTrajectory in a window host", () => {
     expect(new Set(seen).size).toBe(1);
   });
 
-  it("docks the pane over the list when there is no window host", async () => {
+  it("docks the pane over the entire trajectory without a window host and preserves close/reopen", async () => {
     delete (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
 
     await renderTrajectory();
@@ -487,11 +490,37 @@ describe("RequestTrajectory in a window host", () => {
       '[data-testid="trajectory-inspector"]',
     );
     expect(inspector).not.toBeNull();
+    const workspace = container.querySelector(
+      '[data-testid="request-trajectory-workspace"]',
+    )!;
+    const overlay = container.querySelector<HTMLElement>(
+      '[data-testid="trajectory-inspector-overlay"]',
+    )!;
+    const list = container.querySelector('[data-testid="trajectory-list"]')!;
+    expect(overlay.parentElement).toBe(workspace);
+    expect(list.parentElement?.contains(overlay)).toBe(false);
+    expect(overlay.contains(inspector)).toBe(true);
+    expect(overlay.classList.contains("hidden")).toBe(false);
+    expect(onDockedInspectorVisibilityChange).toHaveBeenLastCalledWith(true);
+    await act(async () =>
+      container
+        .querySelector<HTMLButtonElement>(
+          '[data-testid="trajectory-inspector-close"]',
+        )!
+        .click(),
+    );
+    expect(overlay.classList.contains("hidden")).toBe(true);
+    expect(onDockedInspectorVisibilityChange).toHaveBeenLastCalledWith(false);
+    await clickRow("CLIENT");
+    expect(overlay.classList.contains("hidden")).toBe(false);
+    expect(onDockedInspectorVisibilityChange).toHaveBeenLastCalledWith(true);
     // No second window to pin, so the docked pane offers no pin control.
     expect(
       container.querySelector('[data-testid="trajectory-inspector-pin"]'),
     ).toBeNull();
     expect(hostMocks.invoke).not.toHaveBeenCalled();
+    await act(async () => root.render(null));
+    expect(onDockedInspectorVisibilityChange).toHaveBeenLastCalledWith(false);
   });
 
   it("finds the turns that mention a query and opens the one it lands on", async () => {

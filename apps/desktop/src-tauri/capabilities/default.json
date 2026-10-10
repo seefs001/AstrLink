@@ -6,7 +6,8 @@
     "main",
     "trajectory-inspector-*",
     "tray-popover",
-    "raw-access-approval"
+    "raw-access-approval",
+    "tool-review-approval"
   ],
   "permissions": [
     "core:default",

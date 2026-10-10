@@ -75,6 +75,46 @@ it("preserves independent tool review metadata and rejects unsafe review payload
   const parsed = parseRequestRecord({ ...fullRecord, tool_review: summary });
   expect(parsed.status).toBe("succeeded");
   expect(parsed.tool_review).toEqual(summary);
+  expect(parsed.tool_review?.reject_threshold).toBeUndefined();
+  for (const reject_threshold of [0, 0.5, 1]) {
+    const next = {
+      ...summary,
+      reject_threshold,
+      calls: [
+        {
+          ...summary.calls[0],
+          model_verdict: "pass",
+          reason_code: "authorized",
+        },
+      ],
+    };
+    expect(
+      parseRequestRecord({ ...fullRecord, tool_review: next }).tool_review,
+    ).toEqual(next);
+  }
+  for (const reject_threshold of [null, "0.5", NaN, Infinity, -0.1, 1.1]) {
+    expect(() =>
+      parseRequestRecord({
+        ...fullRecord,
+        tool_review: { ...summary, reject_threshold },
+      }),
+    ).toThrow();
+  }
+  for (const extra of [
+    { reason_code: null },
+    { reason_code: "made_up" },
+    { reason_code: 0 },
+    { model_verdict: null },
+    { model_verdict: "error" },
+    { model_verdict: 0 },
+  ]) {
+    expect(() =>
+      parseRequestRecord({
+        ...fullRecord,
+        tool_review: { ...summary, calls: [{ ...summary.calls[0], ...extra }] },
+      }),
+    ).toThrow();
+  }
   expect(
     parseRequestRecord({ ...fullRecord, tool_review: null }).tool_review,
   ).toBeUndefined();
